@@ -100,9 +100,6 @@ get_mime_type(const char* name) {
 
 
 HttpSession::HttpSession(const Socket::Ptr &pSock) : TcpSession(pSock) {
-
-	//设置10秒发送缓存
-	pSock->setSendBufSecond(10);
 	//设置15秒发送超时时间
 	pSock->setSendTimeOutSecond(15);
 
@@ -235,7 +232,7 @@ inline bool HttpSession::checkLiveFlvStream(){
         (*this) << SocketFlags(kSockFlags);
 
 		try{
-			start(mediaSrc);
+			start(getPoller(),mediaSrc);
 		}catch (std::exception &ex){
 			//该rtmp源不存在
 			shutdown();
@@ -686,36 +683,21 @@ inline void HttpSession::sendNotFound(bool bClose) {
 
 
 void HttpSession::onWrite(const Buffer::Ptr &buffer) {
-	weak_ptr<HttpSession> weakSelf = dynamic_pointer_cast<HttpSession>(shared_from_this());
-	async([weakSelf,buffer](){
-		auto strongSelf = weakSelf.lock();
-		if(!strongSelf) {
-			return;
-		}
-		strongSelf->_ticker.resetTime();
-		strongSelf->_ui64TotalBytes += buffer->size();
-		strongSelf->send(buffer);
-	});
+	_ticker.resetTime();
+	_ui64TotalBytes += buffer->size();
+	send(buffer);
 }
 
 void HttpSession::onWrite(const char *data, int len) {
 	BufferRaw::Ptr buffer(new BufferRaw);
 	buffer->assign(data,len);
-
-	weak_ptr<HttpSession> weakSelf = dynamic_pointer_cast<HttpSession>(shared_from_this());
-	async([weakSelf,buffer](){
-		auto strongSelf = weakSelf.lock();
-		if(!strongSelf) {
-			return;
-		}
-		strongSelf->_ticker.resetTime();
-		strongSelf->_ui64TotalBytes += buffer->size();
-		strongSelf->send(buffer);
-	});
+	_ticker.resetTime();
+	_ui64TotalBytes += buffer->size();
+	send(buffer);
 }
 
 void HttpSession::onDetach() {
-	safeShutdown();
+	shutdown();
 }
 
 std::shared_ptr<FlvMuxer> HttpSession::getSharedPtr(){

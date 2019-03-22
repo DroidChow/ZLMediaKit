@@ -73,8 +73,6 @@ static recursive_mutex g_mtxGetter;
 static int kSockFlags = SOCKET_DEFAULE_FLAGS | FLAG_MORE;
 
 RtspSession::RtspSession(const Socket::Ptr &pSock) : TcpSession(pSock) {
-	//设置10秒发送缓存
-	pSock->setSendBufSecond(10);
 	//设置15秒发送超时时间
 	pSock->setSendTimeOutSecond(15);
 
@@ -604,7 +602,7 @@ bool RtspSession::handleReq_Setup(const Parser &parser) {
 		peerAddr.sin_port = htons(ui16PeerPort);
 		peerAddr.sin_addr.s_addr = inet_addr(get_peer_ip().data());
 		bzero(&(peerAddr.sin_zero), sizeof peerAddr.sin_zero);
-		_apPeerRtpPortAddr[trackIdx].reset((struct sockaddr *) (new struct sockaddr_in(peerAddr)));
+		pSockRtp->setSendPeerAddr((struct sockaddr *)(&peerAddr));
 		//尝试获取客户端nat映射地址
 		startListenPeerUdpData(trackIdx);
 		//InfoL << "分配端口:" << srv_port;
@@ -728,34 +726,27 @@ bool RtspSession::handleReq_Play(const Parser &parser) {
 		_enableSendRtp = true;
 
 		//提高发送性能
-		(*this) << SocketFlags(kSockFlags);
 		SockUtil::setNoDelay(_sock->rawFD(),false);
 		(*this) << SocketFlags(kSockFlags);
 
 		if (!_pRtpReader && _rtpType != PlayerBase::RTP_MULTICAST) {
 			weak_ptr<RtspSession> weakSelf = dynamic_pointer_cast<RtspSession>(shared_from_this());
-			_pRtpReader = pMediaSrc->getRing()->attach(useBuf);
+			_pRtpReader = pMediaSrc->getRing()->attach(getPoller(),useBuf);
 			_pRtpReader->setDetachCB([weakSelf]() {
 				auto strongSelf = weakSelf.lock();
 				if(!strongSelf) {
 					return;
 				}
-				strongSelf->safeShutdown();
+				strongSelf->shutdown();
 			});
 			_pRtpReader->setReadCB([weakSelf](const RtpPacket::Ptr &pack) {
 				auto strongSelf = weakSelf.lock();
 				if(!strongSelf) {
 					return;
 				}
-				strongSelf->async([weakSelf,pack](){
-					auto strongSelf = weakSelf.lock();
-					if(!strongSelf) {
-						return;
-					}
-					if(strongSelf->_enableSendRtp) {
-						strongSelf->sendRtpPacket(pack);
-					}
-				});
+				if(strongSelf->_enableSendRtp) {
+					strongSelf->sendRtpPacket(pack);
+				}
 			});
 		}
     };
@@ -993,13 +984,9 @@ inline void RtspSession::sendRtpPacket(const RtpPacket::Ptr & pkt) {
 			shutdown();
 			return;
 		}
-		auto &peerAddr = _apPeerRtpPortAddr[iTrackIndex];
-		if (!peerAddr) {
-			return;
-		}
-        BufferRtp::Ptr buffer(new BufferRtp(pkt,4));
+		BufferRtp::Ptr buffer(new BufferRtp(pkt,4));
         _ui64TotalBytes += buffer->size();
-        pSock->send(buffer,SOCKET_DEFAULE_FLAGS, peerAddr.get());
+        pSock->send(buffer);
 	}
 		break;
 	default:
@@ -1029,7 +1016,7 @@ inline void RtspSession::onRcvPeerUdpData(int iTrackIdx, const Buffer::Ptr &pBuf
 				return;
 			}
 			//设置真实的客户端nat映射端口号
-			_apPeerRtpPortAddr[iTrackIdx / 2].reset(new struct sockaddr(addr));
+			_apRtpSock[iTrackIdx / 2]->setSendPeerAddr(&addr);
 			_abGotPeerUdp[iTrackIdx / 2] = true;
 			_bGotAllPeerUdp = true;//先假设获取到完整的rtp探测包
 			for (unsigned int i = 0; i < _aTrackInfo.size(); i++) {

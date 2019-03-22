@@ -200,17 +200,17 @@ inline void RtmpPusher::send_metaData(){
     sendRequest(MSG_DATA, enc.data());
     
     src->getConfigFrame([&](const RtmpPacket::Ptr &pkt){
-        sendRtmp(pkt->typeId, _ui32StreamId, pkt->strBuf, pkt->timeStamp, pkt->chunkId );
+        sendRtmp(pkt->typeId, _ui32StreamId, pkt, pkt->timeStamp, pkt->chunkId );
     });
     
-    _pRtmpReader = src->getRing()->attach();
+    _pRtmpReader = src->getRing()->attach(getPoller());
     weak_ptr<RtmpPusher> weakSelf = dynamic_pointer_cast<RtmpPusher>(shared_from_this());
     _pRtmpReader->setReadCB([weakSelf](const RtmpPacket::Ptr &pkt){
     	auto strongSelf = weakSelf.lock();
     	if(!strongSelf) {
     		return;
     	}
-    	strongSelf->sendRtmp(pkt->typeId, strongSelf->_ui32StreamId, pkt->strBuf, pkt->timeStamp, pkt->chunkId);
+    	strongSelf->sendRtmp(pkt->typeId, strongSelf->_ui32StreamId, pkt, pkt->timeStamp, pkt->chunkId);
     });
     _pRtmpReader->setDetachCB([weakSelf](){
         auto strongSelf = weakSelf.lock();

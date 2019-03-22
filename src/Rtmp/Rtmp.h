@@ -31,6 +31,7 @@
 #include <cstdlib>
 #include "Util/util.h"
 #include "Util/logger.h"
+#include "Network/Buffer.h"
 #include "Network/sockutil.h"
 using namespace toolkit;
 
@@ -127,7 +128,7 @@ public:
 #pragma pack(pop)
 #endif // defined(_WIN32)
 
-class RtmpPacket {
+class RtmpPacket : public Buffer{
 public:
     typedef std::shared_ptr<RtmpPacket> Ptr;
     uint8_t typeId;
@@ -139,6 +140,30 @@ public:
     uint32_t streamId;
     uint32_t chunkId;
     std::string strBuf;
+public:
+    char *data() const override{
+        return (char*)strBuf.data();
+    }
+    uint32_t size() const override {
+        return strBuf.size();
+    };
+public:
+    RtmpPacket() = default;
+    RtmpPacket(const RtmpPacket &that) = default;
+    RtmpPacket &operator=(const RtmpPacket &that) = default;
+    RtmpPacket &operator=(RtmpPacket &&that) = default;
+
+    RtmpPacket(RtmpPacket &&that){
+        typeId = that.typeId;
+        bodySize = that.bodySize;
+        timeStamp = that.timeStamp;
+        hasAbsStamp = that.hasAbsStamp;
+        hasExtStamp = that.hasExtStamp;
+        deltaStamp = that.deltaStamp;
+        streamId = that.streamId;
+        chunkId = that.chunkId;
+        strBuf = std::move(that.strBuf);
+    }
     bool isVideoKeyFrame() const {
         return typeId == MSG_VIDEO && (uint8_t) strBuf[0] >> 4 == FLV_KEY_FRAME
         && (uint8_t) strBuf[1] == 1;

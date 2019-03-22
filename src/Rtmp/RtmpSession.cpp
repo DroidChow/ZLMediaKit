@@ -35,8 +35,6 @@ static int kSockFlags = SOCKET_DEFAULE_FLAGS | FLAG_MORE;
 
 RtmpSession::RtmpSession(const Socket::Ptr &pSock) : TcpSession(pSock) {
 	DebugL << get_peer_ip();
-	//设置10秒发送缓存
-    pSock->setSendBufSecond(10);
     //设置15秒发送超时时间
     pSock->setSendTimeOutSecond(15);
 }
@@ -338,7 +336,7 @@ void RtmpSession::sendPlayResponse(const string &err,const RtmpMediaSource::Ptr 
         onSendMedia(pkt);
     });
 
-    _pRingReader = src->getRing()->attach();
+    _pRingReader = src->getRing()->attach(getPoller());
     weak_ptr<RtmpSession> weakSelf = dynamic_pointer_cast<RtmpSession>(shared_from_this());
     SockUtil::setNoDelay(_sock->rawFD(), false);
     _pRingReader->setReadCB([weakSelf](const RtmpPacket::Ptr &pkt) {
@@ -346,20 +344,14 @@ void RtmpSession::sendPlayResponse(const string &err,const RtmpMediaSource::Ptr 
         if (!strongSelf) {
             return;
         }
-        strongSelf->async([weakSelf, pkt]() {
-            auto strongSelf = weakSelf.lock();
-            if (!strongSelf) {
-                return;
-            }
-            strongSelf->onSendMedia(pkt);
-        });
+        strongSelf->onSendMedia(pkt);
     });
     _pRingReader->setDetachCB([weakSelf]() {
         auto strongSelf = weakSelf.lock();
         if (!strongSelf) {
             return;
         }
-        strongSelf->safeShutdown();
+        strongSelf->shutdown();
     });
     _pPlayerSrc = src;
     if (src->getRing()->readerCount() == 1) {
@@ -448,13 +440,7 @@ void RtmpSession::onCmd_pause(AMFDecoder &dec) {
 			if(!strongSelf) {
 				return;
 			}
-			strongSelf->async([weakSelf,pkt]() {
-				auto strongSelf = weakSelf.lock();
-				if(!strongSelf) {
-					return;
-				}
-				strongSelf->onSendMedia(pkt);
-			});
+            strongSelf->onSendMedia(pkt);
 		});
 	}
 }
@@ -522,7 +508,7 @@ void RtmpSession::onRtmpChunk(RtmpPacket &chunkData) {
 		if(rtmp_modify_stamp){
 			chunkData.timeStamp = _stampTicker[chunkData.typeId % 2].elapsedTime();
 		}
-		_pPublisherSrc->onWrite(std::make_shared<RtmpPacket>(chunkData));
+		_pPublisherSrc->onWrite(std::make_shared<RtmpPacket>(std::move(chunkData)));
 	}
 		break;
 	default:
@@ -561,7 +547,7 @@ void RtmpSession::onSendMedia(const RtmpPacket::Ptr &pkt) {
 		CLEAR_ARR(_aui32FirstStamp);
 		modifiedStamp = 0;
 	}
-	sendRtmp(pkt->typeId, pkt->streamId, pkt->strBuf, modifiedStamp, pkt->chunkId);
+	sendRtmp(pkt->typeId, pkt->streamId, pkt, modifiedStamp, pkt->chunkId);
 }
 
 void RtmpSession::doDelay(int delaySec, const std::function<void()> &fun) {
