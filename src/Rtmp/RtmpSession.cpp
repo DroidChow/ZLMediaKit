@@ -1,309 +1,277 @@
 ﻿/*
- * MIT License
+ * Copyright (c) 2016-present The ZLMediaKit project authors. All Rights Reserved.
  *
- * Copyright (c) 2016 xiongziliang <771730766@qq.com>
+ * This file is part of ZLMediaKit(https://github.com/ZLMediaKit/ZLMediaKit).
  *
- * This file is part of ZLMediaKit(https://github.com/xiongziliang/ZLMediaKit).
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Use of this source code is governed by MIT-like license that can be found in the
+ * LICENSE file in the root of the source tree. All contributing project authors
+ * may be found in the AUTHORS file in the root of the source tree.
  */
-
 
 #include "RtmpSession.h"
 #include "Common/config.h"
 #include "Util/onceToken.h"
 
+using namespace std;
+using namespace toolkit;
+
 namespace mediakit {
 
-static int kSockFlags = SOCKET_DEFAULE_FLAGS | FLAG_MORE;
-
-RtmpSession::RtmpSession(const Socket::Ptr &pSock) : TcpSession(pSock) {
-	DebugL << get_peer_ip();
-    //设置15秒发送超时时间
-    pSock->setSendTimeOutSecond(15);
-}
-
-RtmpSession::~RtmpSession() {
-    DebugL << get_peer_ip();
-    if(_delayTask){
-        _delayTask();
-        _delayTask = nullptr;
-    }
+RtmpSession::RtmpSession(const Socket::Ptr &sock) : Session(sock) {
+    GET_CONFIG(uint32_t,keep_alive_sec,Rtmp::kKeepAliveSecond);
+    sock->setSendTimeOutSecond(keep_alive_sec);
 }
 
 void RtmpSession::onError(const SockException& err) {
-	DebugL << err.what();
+    bool is_player = !_push_src_ownership;
+    uint64_t duration = _ticker.createdTime() / 1000;
+    WarnP(this) << (is_player ? "RTMP播放器(" : "RTMP推流器(")
+                << _media_info.shortUrl()
+                << ")断开:" << err.what()
+                << ",耗时(s):" << duration;
 
     //流量统计事件广播
-    GET_CONFIG_AND_REGISTER(uint32_t,iFlowThreshold,Broadcast::kFlowThreshold);
+    GET_CONFIG(uint32_t, iFlowThreshold, General::kFlowThreshold);
 
-    if(_ui64TotalBytes > iFlowThreshold * 1024){
-        NoticeCenter::Instance().emitEvent(Broadcast::kBroadcastFlowReport,
-                                           _mediaInfo,
-                                           _ui64TotalBytes,
-                                           _ticker.createdTime()/1000,
-                                           *this);
+    if (_total_bytes >= iFlowThreshold * 1024) {
+        NOTICE_EMIT(BroadcastFlowReportArgs, Broadcast::kBroadcastFlowReport, _media_info, _total_bytes, duration, is_player, *this);
+    }
+
+    //如果是主动关闭的，那么不延迟注销
+    if (_push_src && _continue_push_ms && err.getErrCode() != Err_shutdown) {
+        //取消所有权
+        _push_src_ownership = nullptr;
+        //延时10秒注销流
+        auto push_src = std::move(_push_src);
+        getPoller()->doDelayTask(_continue_push_ms, [push_src]() { return 0; });
     }
 }
 
 void RtmpSession::onManager() {
-	if (_ticker.createdTime() > 15 * 1000) {
-		if (!_pRingReader && !_pPublisherSrc) {
-			WarnL << "非法链接:" << get_peer_ip();
-			shutdown();
-		}
-	}
-	if (_pPublisherSrc) {
-		//publisher
-		if (_ticker.elapsedTime() > 15 * 1000) {
-			WarnL << "数据接收超时:" << get_peer_ip();
-			shutdown();
-		}
-	}
-    if(_delayTask){
-        if(time(NULL) > _iTaskTimeLine){
-            _delayTask();
-            _delayTask = nullptr;
+    GET_CONFIG(uint32_t, handshake_sec, Rtmp::kHandshakeSecond);
+    GET_CONFIG(uint32_t, keep_alive_sec, Rtmp::kKeepAliveSecond);
+
+    if (_ticker.createdTime() > handshake_sec * 1000) {
+        if (!_ring_reader && !_push_src) {
+            shutdown(SockException(Err_timeout, "illegal connection"));
+        }
+    }
+    if (_push_src) {
+        // push
+        if (_ticker.elapsedTime() > keep_alive_sec * 1000) {
+            shutdown(SockException(Err_timeout, "recv data from rtmp pusher timeout"));
         }
     }
 }
 
-void RtmpSession::onRecv(const Buffer::Ptr &pBuf) {
-	_ticker.resetTime();
-	try {
-        _ui64TotalBytes += pBuf->size();
-		onParseRtmp(pBuf->data(), pBuf->size());
-	} catch (exception &e) {
-		WarnL << e.what();
-		shutdown();
-	}
+void RtmpSession::onRecv(const Buffer::Ptr &buf) {
+    _ticker.resetTime();
+    _total_bytes += buf->size();
+    onParseRtmp(buf->data(), buf->size());
 }
 
 void RtmpSession::onCmd_connect(AMFDecoder &dec) {
-	auto params = dec.load<AMFValue>();
-	double amfVer = 0;
-	AMFValue objectEncoding = params["objectEncoding"];
-	if(objectEncoding){
-		amfVer = objectEncoding.as_number();
-	}
-	///////////set chunk size////////////////
-	sendChunkSize(60000);
-	////////////window Acknowledgement size/////
-	sendAcknowledgementSize(5000000);
-	///////////set peerBandwidth////////////////
-	sendPeerBandwidth(5000000);
+    auto params = dec.load<AMFValue>();
+    ///////////set chunk size////////////////
+    sendChunkSize(60000);
+    ////////////window Acknowledgement size/////
+    sendAcknowledgementSize(5000000);
+    ///////////set peerBandwidth////////////////
+    sendPeerBandwidth(5000000);
 
-    _mediaInfo._app = params["app"].as_string();
-    _strTcUrl = params["tcUrl"].as_string();
-    if(_strTcUrl.empty()){
-        //defaultVhost:默认vhost
-        _strTcUrl = string(RTMP_SCHEMA) + "://" + DEFAULT_VHOST + "/" + _mediaInfo._app;
+    auto tc_url = params["tcUrl"].as_string();
+    if (tc_url.empty()) {
+        // defaultVhost:默认vhost
+        tc_url = string(RTMP_SCHEMA) + "://" + DEFAULT_VHOST + "/" + _media_info.app;
+    } else {
+        auto pos = tc_url.rfind('?');
+        if (pos != string::npos) {
+            // tc_url 中可能包含?以及参数，参见issue: #692
+            tc_url = tc_url.substr(0, pos);
+        }
     }
-	bool ok = true; //(app == APP_NAME);
-	AMFValue version(AMF_OBJECT);
-	version.set("fmsVer", "FMS/3,0,1,123");
-	version.set("capabilities", 31.0);
-	AMFValue status(AMF_OBJECT);
-	status.set("level", ok ? "status" : "error");
-	status.set("code", ok ? "NetConnection.Connect.Success" : "NetConnection.Connect.InvalidApp");
-	status.set("description", ok ? "Connection succeeded." : "InvalidApp.");
-	status.set("objectEncoding", amfVer);
-	sendReply(ok ? "_result" : "_error", version, status);
-	if (!ok) {
-		throw std::runtime_error("Unsupported application: " + _mediaInfo._app);
-	}
+    // 初步解析，只用于获取vhost信息
+    _media_info.parse(tc_url);
+    _media_info.schema = RTMP_SCHEMA;
+    // 赋值rtmp app
+    _media_info.app = params["app"].as_string();
 
-	AMFEncoder invoke;
-	invoke << "onBWDone" << 0.0 << nullptr;
-	sendResponse(MSG_CMD, invoke.data());
+    _media_info.protocol = overSsl() ? "rtmps" : "rtmp";
+
+    bool ok = true; //(app == APP_NAME);
+    AMFValue version(AMF_OBJECT);
+    version.set("fmsVer", "FMS/3,0,1,123");
+    version.set("capabilities", 31.0);
+    AMFValue status(AMF_OBJECT);
+    status.set("level", ok ? "status" : "error");
+    status.set("code", ok ? "NetConnection.Connect.Success" : "NetConnection.Connect.InvalidApp");
+    status.set("description", ok ? "Connection succeeded." : "InvalidApp.");
+    status.set("objectEncoding", params["objectEncoding"]);
+    sendReply(ok ? "_result" : "_error", version, status);
+    if (!ok) {
+        throw std::runtime_error("Unsupported application: " + _media_info.app);
+    }
+
+    AMFEncoder invoke;
+    invoke << "onBWDone" << 0.0 << nullptr;
+    sendResponse(MSG_CMD, invoke.data());
 }
 
 void RtmpSession::onCmd_createStream(AMFDecoder &dec) {
-	sendReply("_result", nullptr, double(STREAM_MEDIA));
+    sendReply("_result", nullptr, double(STREAM_MEDIA));
 }
 
 void RtmpSession::onCmd_publish(AMFDecoder &dec) {
-    std::shared_ptr<Ticker> pTicker(new Ticker);
-    std::shared_ptr<onceToken> pToken(new onceToken(nullptr,[pTicker](){
-        DebugL << "publish 回复时间:" << pTicker->elapsedTime() << "ms";
+    std::shared_ptr<Ticker> ticker(new Ticker);
+    weak_ptr<RtmpSession> weak_self = static_pointer_cast<RtmpSession>(shared_from_this());
+    std::shared_ptr<onceToken> token(new onceToken(nullptr, [ticker, weak_self]() {
+        auto strong_self = weak_self.lock();
+        if (strong_self) {
+            DebugP(strong_self.get()) << "publish 回复时间:" << ticker->elapsedTime() << "ms";
+        }
     }));
-	dec.load<AMFValue>();/* NULL */
-    _mediaInfo.parse(_strTcUrl + "/" + dec.load<std::string>());
+    dec.load<AMFValue>();/* NULL */
+    // 赋值为rtmp stream id 信息
+    _media_info.stream = getStreamId(dec.load<std::string>());
+    // 再解析url，切割url为app/stream_id (不一定符合rtmp url切割规范)
+    _media_info.parse(_media_info.getUrl());
 
-    auto onRes = [this,pToken](const string &err){
-        auto src = dynamic_pointer_cast<RtmpMediaSource>(MediaSource::find(RTMP_SCHEMA,
-                                                                           _mediaInfo._vhost,
-                                                                           _mediaInfo._app,
-                                                                           _mediaInfo._streamid,
-                                                                           false));
-        bool authSuccess = err.empty();
-        bool ok = (!src && !_pPublisherSrc && authSuccess);
-        AMFValue status(AMF_OBJECT);
-        status.set("level", ok ? "status" : "error");
-        status.set("code", ok ? "NetStream.Publish.Start" : (authSuccess ? "NetStream.Publish.BadName" : "NetStream.Publish.BadAuth"));
-        status.set("description", ok ? "Started publishing stream." : (authSuccess ? "Already publishing." : err.data()));
-        status.set("clientid", "0");
-        sendReply("onStatus", nullptr, status);
-        if (!ok) {
-            WarnL << "onPublish:"
-                  << (authSuccess ? "Already publishing:" : err.data()) << " "
-                  << _mediaInfo._vhost << " "
-                  << _mediaInfo._app << " "
-                  << _mediaInfo._streamid << endl;
-            shutdown();
+    auto now_stream_index = _now_stream_index;
+    auto on_res = [this, token, now_stream_index](const string &err, const ProtocolOption &option) {
+        _now_stream_index = now_stream_index;
+        if (!err.empty()) {
+            sendStatus({ "level", "error",
+                         "code", "NetStream.Publish.BadAuth",
+                         "description", err,
+                         "clientid", "0" });
+            shutdown(SockException(Err_shutdown, StrPrinter << "Unauthorized:" << err));
             return;
         }
-        _pPublisherSrc.reset(new RtmpToRtspMediaSource(_mediaInfo._vhost,_mediaInfo._app,_mediaInfo._streamid));
-        _pPublisherSrc->setListener(dynamic_pointer_cast<MediaSourceEvent>(shared_from_this()));
+
+        assert(!_push_src);
+        auto src = MediaSource::find(RTMP_SCHEMA, _media_info.vhost, _media_info.app, _media_info.stream);
+        auto push_failed = (bool)src;
+
+        while (src) {
+            //尝试断连后继续推流
+            auto rtmp_src = dynamic_pointer_cast<RtmpMediaSourceImp>(src);
+            if (!rtmp_src) {
+                //源不是rtmp推流产生的
+                break;
+            }
+            auto ownership = rtmp_src->getOwnership();
+            if (!ownership) {
+                //获取推流源所有权失败
+                break;
+            }
+            _push_src = std::move(rtmp_src);
+            _push_src_ownership = std::move(ownership);
+            push_failed = false;
+            break;
+        }
+
+        if (push_failed) {
+            sendStatus({"level", "error",
+                        "code", "NetStream.Publish.BadName",
+                        "description", "Already publishing.",
+                        "clientid", "0" });
+            shutdown(SockException(Err_shutdown, StrPrinter << "Already publishing:" << err));
+            return;
+        }
+
+        if (!_push_src) {
+            _push_src = std::make_shared<RtmpMediaSourceImp>(_media_info);
+            //获取所有权
+            _push_src_ownership = _push_src->getOwnership();
+            _push_src->setProtocolOption(option);
+        }
+
+        _push_src->setListener(static_pointer_cast<RtmpSession>(shared_from_this()));
+        _continue_push_ms = option.continue_push_ms;
+        sendStatus({"level", "status",
+                    "code", "NetStream.Publish.Start",
+                    "description", "Started publishing stream.",
+                    "clientid", "0" });
+
+        setSocketFlags();
     };
 
-    weak_ptr<RtmpSession> weakSelf = dynamic_pointer_cast<RtmpSession>(shared_from_this());
-    Broadcast::AuthInvoker invoker = [weakSelf,onRes,pToken](const string &err){
-        auto strongSelf = weakSelf.lock();
-        if(!strongSelf){
+    if(_media_info.app.empty() || _media_info.stream.empty()){
+        //不允许莫名其妙的推流url
+        on_res("rtmp推流url非法", ProtocolOption());
+        return;
+    }
+
+    Broadcast::PublishAuthInvoker invoker = [weak_self, on_res, token](const string &err, const ProtocolOption &option) {
+        auto strong_self = weak_self.lock();
+        if (!strong_self) {
             return;
         }
-        strongSelf->async([weakSelf,onRes,err,pToken](){
-            auto strongSelf = weakSelf.lock();
-            if(!strongSelf){
+        strong_self->async([weak_self, on_res, err, token, option]() {
+            auto strong_self = weak_self.lock();
+            if (!strong_self) {
                 return;
             }
-            onRes(err);
+            on_res(err, option);
         });
     };
-    auto flag = NoticeCenter::Instance().emitEvent(Broadcast::kBroadcastMediaPublish,
-                                                   _mediaInfo,
-                                                   invoker,
-                                                   *this);
+    auto flag = NOTICE_EMIT(BroadcastMediaPublishArgs, Broadcast::kBroadcastMediaPublish, MediaOriginType::rtmp_push, _media_info, invoker, *this);
     if(!flag){
         //该事件无人监听，默认鉴权成功
-        onRes("");
+        on_res("", ProtocolOption());
     }
 }
 
 void RtmpSession::onCmd_deleteStream(AMFDecoder &dec) {
-	AMFValue status(AMF_OBJECT);
-	status.set("level", "status");
-	status.set("code", "NetStream.Unpublish.Success");
-	status.set("description", "Stop publishing.");
-	sendReply("onStatus", nullptr, status);
-	throw std::runtime_error(StrPrinter << "Stop publishing." << endl);
+    _push_src = nullptr;
+    //此时回复可能触发broken pipe事件，从而直接触发onError回调；所以需要先把_push_src置空，防止触发断流续推功能
+    sendStatus({ "level", "status",
+                 "code", "NetStream.Unpublish.Success",
+                 "description", "Stop publishing." });
+    throw std::runtime_error(StrPrinter << "Stop publishing" << endl);
 }
 
-void RtmpSession::findStream(const function<void(const RtmpMediaSource::Ptr &src)> &cb,bool retry) {
-    auto src = dynamic_pointer_cast<RtmpMediaSource>(MediaSource::find(RTMP_SCHEMA,
-                                                                       _mediaInfo._vhost,
-                                                                       _mediaInfo._app,
-                                                                       _mediaInfo._streamid,
-                                                                       true));
-    if(src || !retry){
-        cb(src);
-        return;
-    }
-
-    //广播未找到流
-    NoticeCenter::Instance().emitEvent(Broadcast::kBroadcastNotFoundStream,_mediaInfo,*this);
-
-    weak_ptr<RtmpSession> weakSelf = dynamic_pointer_cast<RtmpSession>(shared_from_this());
-    auto task_id = this;
-    auto media_info = _mediaInfo;
-
-    auto onRegist = [task_id, weakSelf, media_info, cb](BroadcastMediaChangedArgs) {
-        if(bRegist &&
-           schema == media_info._schema &&
-           vhost == media_info._vhost &&
-           app == media_info._app &&
-           stream == media_info._streamid){
-            //播发器请求的rtmp流终于注册上了
-            auto strongSelf = weakSelf.lock();
-            if(!strongSelf) {
-                return;
-            }
-            //切换到自己的线程再回复
-            //如果触发 kBroadcastMediaChanged 事件的线程与本RtmpSession绑定的线程相同,
-            //那么strongSelf->async操作可能是同步操作,
-            //通过指定参数may_sync为false确保 NoticeCenter::delListener操作延后执行,
-            //以便防止遍历事件监听对象map时做删除操作
-            strongSelf->async([task_id,weakSelf,media_info,cb](){
-                auto strongSelf = weakSelf.lock();
-                if(!strongSelf) {
-                    return;
-                }
-                DebugL << "收到rtmp注册事件,回复播放器:" << media_info._schema << "/" << media_info._vhost << "/" << media_info._app << "/" << media_info._streamid;
-
-                //再找一遍媒体源，一般能找到
-                strongSelf->findStream(cb,false);
-
-                //取消延时任务，防止多次回复
-                strongSelf->cancelDelyaTask();
-
-                //取消事件监听
-                //在事件触发时不能在当前线程移除事件监听,否则会导致遍历map时做删除操作导致程序崩溃
-                NoticeCenter::Instance().delListener(task_id,Broadcast::kBroadcastMediaChanged);
-            }, false);
+void RtmpSession::sendStatus(const std::initializer_list<string> &key_value) {
+    AMFValue status(AMF_OBJECT);
+    int i = 0;
+    string key;
+    for (auto &val : key_value) {
+        if (++i % 2 == 0) {
+            status.set(key, val);
+        } else {
+            key = val;
         }
-    };
-
-    NoticeCenter::Instance().addListener(task_id, Broadcast::kBroadcastMediaChanged, onRegist);
-    //5秒后执行失败回调
-    doDelay(5, [cb,task_id]() {
-        //取消监听该事件,该延时任务可以在本对象析构时或到达指定延时后调用
-        //所以该对象在销毁前一定会被取消事件监听
-        NoticeCenter::Instance().delListener(task_id,Broadcast::kBroadcastMediaChanged);
-        cb(nullptr);
-    });
-
+    }
+    sendReply("onStatus", nullptr, status);
 }
 
-void RtmpSession::sendPlayResponse(const string &err,const RtmpMediaSource::Ptr &src){
-    bool authSuccess = err.empty();
-    bool ok = (src.operator bool() && authSuccess);
+void RtmpSession::sendPlayResponse(const string &err, const RtmpMediaSource::Ptr &src) {
+    bool auth_success = err.empty();
+    bool ok = (src.operator bool() && auth_success);
     if (ok) {
         //stream begin
         sendUserControl(CONTROL_STREAM_BEGIN, STREAM_MEDIA);
     }
     // onStatus(NetStream.Play.Reset)
-    AMFValue status(AMF_OBJECT);
-    status.set("level", ok ? "status" : "error");
-    status.set("code", ok ? "NetStream.Play.Reset" : (authSuccess ? "NetStream.Play.StreamNotFound" : "NetStream.Play.BadAuth"));
-    status.set("description", ok ? "Resetting and playing." : (authSuccess ? "No such stream." : err.data()));
-    status.set("details", _mediaInfo._streamid);
-    status.set("clientid", "0");
-    sendReply("onStatus", nullptr, status);
+    sendStatus({ "level", (ok ? "status" : "error"),
+                 "code", (ok ? "NetStream.Play.Reset" : (auth_success ? "NetStream.Play.StreamNotFound" : "NetStream.Play.BadAuth")),
+                 "description", (ok ? "Resetting and playing." : (auth_success ? "No such stream." : err.data())),
+                 "details", _media_info.stream,
+                 "clientid", "0" });
+
     if (!ok) {
-        WarnL << (authSuccess ? "No such stream:" : err.data()) << " "
-              << _mediaInfo._vhost << " "
-              << _mediaInfo._app << " "
-              << _mediaInfo._streamid
-              << endl;
-        shutdown();
+        string err_msg = StrPrinter << (auth_success ? "no such stream:" : err.data()) << " " << _media_info.shortUrl();
+        shutdown(SockException(Err_shutdown, err_msg));
         return;
     }
 
     // onStatus(NetStream.Play.Start)
-    status.clear();
-    status.set("level", "status");
-    status.set("code", "NetStream.Play.Start");
-    status.set("description", "Started playing.");
-    status.set("details", _mediaInfo._streamid);
-    status.set("clientid", "0");
-    sendReply("onStatus", nullptr, status);
+
+    sendStatus({ "level", "status",
+                 "code", "NetStream.Play.Start",
+                 "description", "Started playing." ,
+                 "details", _media_info.stream,
+                 "clientid", "0"});
 
     // |RtmpSampleAccess(true, true)
     AMFEncoder invoke;
@@ -318,49 +286,58 @@ void RtmpSession::sendPlayResponse(const string &err,const RtmpMediaSource::Ptr 
     sendResponse(MSG_DATA, invoke.data());
 
     //onStatus(NetStream.Play.PublishNotify)
-    status.clear();
-    status.set("level", "status");
-    status.set("code", "NetStream.Play.PublishNotify");
-    status.set("description", "Now published.");
-    status.set("details", _mediaInfo._streamid);
-    status.set("clientid", "0");
-    sendReply("onStatus", nullptr, status);
+    sendStatus({ "level", "status",
+                 "code", "NetStream.Play.PublishNotify",
+                 "description", "Now published." ,
+                 "details", _media_info.stream,
+                 "clientid", "0"});
+    // metadata
+    src->getMetaData([&](const AMFValue &metadata) {
+        invoke.clear();
+        invoke << "onMetaData" << metadata;
+        sendResponse(MSG_DATA, invoke.data());
+    });
 
-    // onMetaData
-    invoke.clear();
-    invoke << "onMetaData" << src->getMetaData();
-    sendResponse(MSG_DATA, invoke.data());
-
+    // config frame
     src->getConfigFrame([&](const RtmpPacket::Ptr &pkt) {
-        //DebugL<<"send initial frame";
         onSendMedia(pkt);
     });
 
-    _pRingReader = src->getRing()->attach(getPoller());
-    weak_ptr<RtmpSession> weakSelf = dynamic_pointer_cast<RtmpSession>(shared_from_this());
-    SockUtil::setNoDelay(_sock->rawFD(), false);
-    _pRingReader->setReadCB([weakSelf](const RtmpPacket::Ptr &pkt) {
-        auto strongSelf = weakSelf.lock();
-        if (!strongSelf) {
+    src->pause(false);
+    _ring_reader = src->getRing()->attach(getPoller());
+    weak_ptr<RtmpSession> weak_self = static_pointer_cast<RtmpSession>(shared_from_this());
+    _ring_reader->setGetInfoCB([weak_self]() {
+        Any ret;
+        ret.set(static_pointer_cast<Session>(weak_self.lock()));
+        return ret;
+    });
+    _ring_reader->setReadCB([weak_self](const RtmpMediaSource::RingDataType &pkt) {
+        auto strong_self = weak_self.lock();
+        if (!strong_self) {
             return;
         }
-        strongSelf->onSendMedia(pkt);
+        size_t i = 0;
+        auto size = pkt->size();
+        strong_self->setSendFlushFlag(false);
+        pkt->for_each([&](const RtmpPacket::Ptr &rtmp){
+            if(++i == size){
+                strong_self->setSendFlushFlag(true);
+            }
+            strong_self->onSendMedia(rtmp);
+        });
     });
-    _pRingReader->setDetachCB([weakSelf]() {
-        auto strongSelf = weakSelf.lock();
-        if (!strongSelf) {
+    _ring_reader->setDetachCB([weak_self]() {
+        auto strong_self = weak_self.lock();
+        if (!strong_self) {
             return;
         }
-        strongSelf->shutdown();
+        strong_self->sendUserControl(CONTROL_STREAM_EOF/*or CONTROL_STREAM_DRY ?*/, STREAM_MEDIA);
+        strong_self->shutdown(SockException(Err_shutdown,"rtmp ring buffer detached"));
     });
-    _pPlayerSrc = src;
-    if (src->getRing()->readerCount() == 1) {
-        src->seekTo(0);
-    }
-
-    //提高发送性能
-    (*this) << SocketFlags(kSockFlags);
-    SockUtil::setNoDelay(_sock->rawFD(),false);
+    src->pause(false);
+    _play_src = src;
+    //提高服务器发送性能
+    setSocketFlags();
 }
 
 void RtmpSession::doPlayResponse(const string &err,const std::function<void(bool)> &cb){
@@ -371,196 +348,292 @@ void RtmpSession::doPlayResponse(const string &err,const std::function<void(bool
         return;
     }
 
-    weak_ptr<RtmpSession> weakSelf = dynamic_pointer_cast<RtmpSession>(shared_from_this());
     //鉴权成功，查找媒体源并回复
-    findStream([weakSelf,cb](const RtmpMediaSource::Ptr &src){
-        auto strongSelf = weakSelf.lock();
-        if(strongSelf){
-            strongSelf->sendPlayResponse("", src);
+    weak_ptr<RtmpSession> weak_self = static_pointer_cast<RtmpSession>(shared_from_this());
+    MediaSource::findAsync(_media_info, weak_self.lock(), [weak_self,cb](const MediaSource::Ptr &src){
+        auto rtmp_src = dynamic_pointer_cast<RtmpMediaSource>(src);
+        auto strong_self = weak_self.lock();
+        if(strong_self){
+            strong_self->sendPlayResponse("", rtmp_src);
         }
-        cb(src.operator bool());
+        cb(rtmp_src.operator bool());
     });
 }
 
 void RtmpSession::doPlay(AMFDecoder &dec){
-    std::shared_ptr<Ticker> pTicker(new Ticker);
-    std::shared_ptr<onceToken> pToken(new onceToken(nullptr,[pTicker](){
-        DebugL << "play 回复时间:" << pTicker->elapsedTime() << "ms";
+    std::shared_ptr<Ticker> ticker(new Ticker);
+    weak_ptr<RtmpSession> weak_self = static_pointer_cast<RtmpSession>(shared_from_this());
+    std::shared_ptr<onceToken> token(new onceToken(nullptr, [ticker,weak_self](){
+        auto strong_self = weak_self.lock();
+        if (strong_self) {
+            DebugP(strong_self.get()) << "play 回复时间:" << ticker->elapsedTime() << "ms";
+        }
     }));
-    weak_ptr<RtmpSession> weakSelf = dynamic_pointer_cast<RtmpSession>(shared_from_this());
-    Broadcast::AuthInvoker invoker = [weakSelf,pToken](const string &err){
-        auto strongSelf = weakSelf.lock();
-        if(!strongSelf){
+    auto now_stream_index = _now_stream_index;
+    Broadcast::AuthInvoker invoker = [weak_self, token, now_stream_index](const string &err) {
+        auto strong_self = weak_self.lock();
+        if (!strong_self) {
             return;
         }
-        strongSelf->async([weakSelf,err,pToken](){
-            auto strongSelf = weakSelf.lock();
-            if(!strongSelf){
+        strong_self->async([weak_self, err, token, now_stream_index]() {
+            auto strong_self = weak_self.lock();
+            if (!strong_self) {
                 return;
             }
-            strongSelf->doPlayResponse(err,[pToken](bool){});
+            strong_self->_now_stream_index = now_stream_index;
+            strong_self->doPlayResponse(err, [token](bool) {});
         });
     };
-    auto flag = NoticeCenter::Instance().emitEvent(Broadcast::kBroadcastMediaPlayed,_mediaInfo,invoker,*this);
-    if(!flag){
-        //该事件无人监听,默认不鉴权
-        doPlayResponse("",[pToken](bool){});
+
+    auto flag = NOTICE_EMIT(BroadcastMediaPlayedArgs, Broadcast::kBroadcastMediaPlayed, _media_info, invoker, *this);
+    if (!flag) {
+        // 该事件无人监听,默认不鉴权
+        doPlayResponse("", [token](bool) {});
     }
 }
+
 void RtmpSession::onCmd_play2(AMFDecoder &dec) {
-	doPlay(dec);
+    doPlay(dec);
 }
+
+string RtmpSession::getStreamId(const string &str){
+    string stream_id;
+    string params;
+    auto pos = str.find('?');
+    if (pos != string::npos) {
+        //有url参数
+        stream_id = str.substr(0, pos);
+        //获取url参数
+        params = str.substr(pos + 1);
+    } else {
+        //没有url参数
+        stream_id = str;
+    }
+
+    pos = stream_id.find(":");
+    if (pos != string::npos) {
+        //vlc和ffplay在播放 rtmp://127.0.0.1/record/0.mp4时，
+        //传过来的url会是rtmp://127.0.0.1/record/mp4:0,
+        //我们在这里还原成0.mp4
+        //实际使用时发现vlc，mpv等会传过来rtmp://127.0.0.1/record/mp4:0.mp4,这里做个判断
+        auto ext = stream_id.substr(0, pos);
+        stream_id = stream_id.substr(pos + 1);
+        if (stream_id.find(ext) == string::npos) {
+            stream_id = stream_id + "." + ext;
+        }
+    }
+
+    if (params.empty()) {
+        //没有url参数
+        return stream_id;
+    }
+
+    //有url参数
+    return stream_id + '?' + params;
+}
+
 void RtmpSession::onCmd_play(AMFDecoder &dec) {
-	dec.load<AMFValue>();/* NULL */
-    _mediaInfo.parse(_strTcUrl + "/" + dec.load<std::string>());
-	doPlay(dec);
+    dec.load<AMFValue>(); /* NULL */
+    // 赋值为rtmp stream id 信息
+    _media_info.stream = getStreamId(dec.load<std::string>());
+    // 再解析url，切割url为app/stream_id (不一定符合rtmp url切割规范)
+    _media_info.parse(_media_info.getUrl());
+    doPlay(dec);
 }
 
 void RtmpSession::onCmd_pause(AMFDecoder &dec) {
-	dec.load<AMFValue>();/* NULL */
-	bool paused = dec.load<bool>();
-	TraceL << paused;
-	AMFValue status(AMF_OBJECT);
-	status.set("level", "status");
-	status.set("code", paused ? "NetStream.Pause.Notify" : "NetStream.Unpause.Notify");
-	status.set("description", paused ? "Paused stream." : "Unpaused stream.");
-	sendReply("onStatus", nullptr, status);
-//streamBegin
-	sendUserControl(paused ? CONTROL_STREAM_EOF : CONTROL_STREAM_BEGIN,
-	STREAM_MEDIA);
-	if (!_pRingReader) {
-		throw std::runtime_error("Rtmp not started yet!");
-	}
-	if (paused) {
-		_pRingReader->setReadCB(nullptr);
-	} else {
-		weak_ptr<RtmpSession> weakSelf = dynamic_pointer_cast<RtmpSession>(shared_from_this());
-		_pRingReader->setReadCB([weakSelf](const RtmpPacket::Ptr &pkt) {
-			auto strongSelf = weakSelf.lock();
-			if(!strongSelf) {
-				return;
-			}
-            strongSelf->onSendMedia(pkt);
-		});
-	}
+    dec.load<AMFValue>();/* NULL */
+    bool paused = dec.load<bool>();
+    TraceP(this) << paused;
+
+    sendStatus({ "level", "status",
+                 "code", (paused ? "NetStream.Pause.Notify" : "NetStream.Unpause.Notify"),
+                 "description", (paused ? "Paused stream." : "Unpaused stream.")});
+
+    //streamBegin
+    sendUserControl(paused ? CONTROL_STREAM_EOF : CONTROL_STREAM_BEGIN, STREAM_MEDIA);
+    auto strongSrc = _play_src.lock();
+    if (strongSrc) {
+        strongSrc->pause(paused);
+    }
+}
+
+void RtmpSession::onCmd_playCtrl(AMFDecoder &dec) {
+    dec.load<AMFValue>();
+    auto ctrlObj = dec.load<AMFValue>();
+    int ctrlType = ctrlObj["ctrlType"].as_integer();
+    float speed = ctrlObj["speed"].as_number();
+
+    sendStatus({ "level", "status",
+                 "code", "NetStream.Speed.Notify",
+                 "description", "Speeding"});
+
+    //streamBegin
+    sendUserControl(CONTROL_STREAM_EOF, STREAM_MEDIA);
+
+    auto strong_src = _play_src.lock();
+    if (strong_src) {
+        strong_src->speed(speed);
+    }
 }
 
 void RtmpSession::setMetaData(AMFDecoder &dec) {
-	if (!_pPublisherSrc) {
-		throw std::runtime_error("not a publisher");
-	}
-	std::string type = dec.load<std::string>();
-	if (type != "onMetaData") {
-		throw std::runtime_error("can only set metadata");
-	}
-	_pPublisherSrc->onGetMetaData(dec.load<AMFValue>());
+    std::string type = dec.load<std::string>();
+    if (type != "onMetaData") {
+        throw std::runtime_error("can only set metadata");
+    }
+    _push_metadata = dec.load<AMFValue>();
+    _set_meta_data = false;
 }
 
 void RtmpSession::onProcessCmd(AMFDecoder &dec) {
-    typedef void (RtmpSession::*rtmpCMDHandle)(AMFDecoder &dec);
-    static unordered_map<string, rtmpCMDHandle> g_mapCmd;
+    typedef void (RtmpSession::*cmd_function)(AMFDecoder &dec);
+    static unordered_map<string, cmd_function> s_cmd_functions;
     static onceToken token([]() {
-        g_mapCmd.emplace("connect",&RtmpSession::onCmd_connect);
-        g_mapCmd.emplace("createStream",&RtmpSession::onCmd_createStream);
-        g_mapCmd.emplace("publish",&RtmpSession::onCmd_publish);
-        g_mapCmd.emplace("deleteStream",&RtmpSession::onCmd_deleteStream);
-        g_mapCmd.emplace("play",&RtmpSession::onCmd_play);
-        g_mapCmd.emplace("play2",&RtmpSession::onCmd_play2);
-        g_mapCmd.emplace("seek",&RtmpSession::onCmd_seek);
-        g_mapCmd.emplace("pause",&RtmpSession::onCmd_pause);}, []() {});
+        s_cmd_functions.emplace("connect", &RtmpSession::onCmd_connect);
+        s_cmd_functions.emplace("createStream", &RtmpSession::onCmd_createStream);
+        s_cmd_functions.emplace("publish", &RtmpSession::onCmd_publish);
+        s_cmd_functions.emplace("deleteStream", &RtmpSession::onCmd_deleteStream);
+        s_cmd_functions.emplace("play", &RtmpSession::onCmd_play);
+        s_cmd_functions.emplace("play2", &RtmpSession::onCmd_play2);
+        s_cmd_functions.emplace("seek", &RtmpSession::onCmd_seek);
+        s_cmd_functions.emplace("pause", &RtmpSession::onCmd_pause);
+        s_cmd_functions.emplace("onPlayCtrl", &RtmpSession::onCmd_playCtrl);
+    });
 
     std::string method = dec.load<std::string>();
-	auto it = g_mapCmd.find(method);
-	if (it == g_mapCmd.end()) {
-		TraceL << "can not support cmd:" << method;
-		return;
-	}
-	_dNowReqID = dec.load<double>();
-	auto fun = it->second;
-	(this->*fun)(dec);
+    auto it = s_cmd_functions.find(method);
+    if (it == s_cmd_functions.end()) {
+//		TraceP(this) << "can not support cmd:" << method;
+        return;
+    }
+    _recv_req_id = dec.load<double>();
+    auto fun = it->second;
+    (this->*fun)(dec);
 }
 
-void RtmpSession::onRtmpChunk(RtmpPacket &chunkData) {
-	switch (chunkData.typeId) {
-	case MSG_CMD:
-	case MSG_CMD3: {
-		AMFDecoder dec(chunkData.strBuf, chunkData.typeId == MSG_CMD3 ? 1 : 0);
-		onProcessCmd(dec);
-	}
-		break;
+void RtmpSession::onRtmpChunk(RtmpPacket::Ptr packet) {
+    auto &chunk_data = *packet;
+    switch (chunk_data.type_id) {
+    case MSG_CMD:
+    case MSG_CMD3: {
+        AMFDecoder dec(chunk_data.buffer, chunk_data.type_id == MSG_CMD3 ? 3 : 0);
+        onProcessCmd(dec);
+        break;
+    }
 
-	case MSG_DATA:
-	case MSG_DATA3: {
-		AMFDecoder dec(chunkData.strBuf, chunkData.typeId == MSG_CMD3 ? 1 : 0);
-		std::string type = dec.load<std::string>();
-		TraceL << "notify:" << type;
-		if (type == "@setDataFrame") {
-			setMetaData(dec);
-		}
-	}
-		break;
-	case MSG_AUDIO:
-	case MSG_VIDEO: {
-		if (!_pPublisherSrc) {
-			throw std::runtime_error("Not a rtmp publisher!");
-		}
-		GET_CONFIG_AND_REGISTER(bool,rtmp_modify_stamp,Rtmp::kModifyStamp);
-		if(rtmp_modify_stamp){
-			chunkData.timeStamp = _stampTicker[chunkData.typeId % 2].elapsedTime();
-		}
-		_pPublisherSrc->onWrite(std::make_shared<RtmpPacket>(std::move(chunkData)));
-	}
-		break;
-	default:
-		WarnL << "unhandled message:" << (int) chunkData.typeId << hexdump(chunkData.strBuf.data(), chunkData.strBuf.size());
-		break;
-	}
+    case MSG_DATA:
+    case MSG_DATA3: {
+        AMFDecoder dec(chunk_data.buffer, chunk_data.type_id == MSG_DATA3 ? 3 : 0);
+        std::string type = dec.load<std::string>();
+        if (type == "@setDataFrame") {
+            setMetaData(dec);
+        } else if (type == "onMetaData") {
+            //兼容某些不规范的推流器
+            _push_metadata = dec.load<AMFValue>();
+            _set_meta_data = false;
+        } else {
+            TraceP(this) << "unknown notify:" << type;
+        }
+        break;
+    }
+
+    case MSG_AUDIO:
+    case MSG_VIDEO: {
+        if (!_push_src) {
+            if (_ring_reader) {
+                throw std::runtime_error("Rtmp player send media packets");
+            }
+            if (packet->isConfigFrame()) {
+                auto id = packet->type_id;
+                _push_config_packets.emplace(id, std::move(packet));
+            }
+            WarnL << "Rtmp pusher send media packet before handshake completed!";
+            return;
+        }
+
+        if (!_set_meta_data) {
+            _set_meta_data = true;
+            _push_src->setMetaData(_push_metadata ? _push_metadata : TitleMeta().getMetadata());
+        }
+        if (!_push_config_packets.empty()) {
+            for (auto &pr : _push_config_packets) {
+                _push_src->onWrite(std::move(pr.second));
+            }
+            _push_config_packets.clear();
+        }
+        _push_src->onWrite(std::move(packet));
+        break;
+    }
+
+    default:
+        WarnP(this) << "unhandled message:" << (int) chunk_data.type_id << hexdump(chunk_data.buffer.data(), chunk_data.buffer.size());
+        break;
+    }
 }
 
 void RtmpSession::onCmd_seek(AMFDecoder &dec) {
     dec.load<AMFValue>();/* NULL */
-    auto milliSeconds = dec.load<AMFValue>().as_number();
-    InfoL << "rtmp seekTo(ms):" << milliSeconds;
-    auto stongSrc = _pPlayerSrc.lock();
-    if (stongSrc) {
-        stongSrc->seekTo(milliSeconds);
+    sendStatus({ "level", "status",
+                 "code", "NetStream.Seek.Notify",
+                 "description", "Seeking."});
+
+    auto milliSeconds = (uint32_t)(dec.load<AMFValue>().as_number());
+    InfoP(this) << "rtmp seekTo(ms):" << milliSeconds;
+    auto strong_src = _play_src.lock();
+    if (strong_src) {
+        strong_src->seekTo(milliSeconds);
     }
-	AMFValue status(AMF_OBJECT);
-	AMFEncoder invoke;
-	status.set("level", "status");
-	status.set("code", "NetStream.Seek.Notify");
-	status.set("description", "Seeking.");
-	sendReply("onStatus", nullptr, status);
 }
 
 void RtmpSession::onSendMedia(const RtmpPacket::Ptr &pkt) {
-	auto modifiedStamp = pkt->timeStamp;
-	auto &firstStamp = _aui32FirstStamp[pkt->typeId % 2];
-	if(!firstStamp){
-		firstStamp = modifiedStamp;
-	}
-	if(modifiedStamp >= firstStamp){
-		//计算时间戳增量
-		modifiedStamp -= firstStamp;
-	}else{
-		//发生回环，重新计算时间戳增量
-		CLEAR_ARR(_aui32FirstStamp);
-		modifiedStamp = 0;
-	}
-	sendRtmp(pkt->typeId, pkt->streamId, pkt, modifiedStamp, pkt->chunkId);
+    sendRtmp(pkt->type_id, pkt->stream_index, pkt, pkt->time_stamp, pkt->chunk_id);
 }
 
-void RtmpSession::doDelay(int delaySec, const std::function<void()> &fun) {
-    if(_delayTask){
-        _delayTask();
+bool RtmpSession::close(MediaSource &sender) {
+    shutdown(SockException(Err_shutdown, "close media: " + sender.getUrl()));
+    return true;
+}
+
+int RtmpSession::totalReaderCount(MediaSource &sender) {
+    return _push_src ? _push_src->totalReaderCount() : sender.readerCount();
+}
+
+MediaOriginType RtmpSession::getOriginType(MediaSource &sender) const{
+    return MediaOriginType::rtmp_push;
+}
+
+string RtmpSession::getOriginUrl(MediaSource &sender) const {
+    return _media_info.full_url;
+}
+
+std::shared_ptr<SockInfo> RtmpSession::getOriginSock(MediaSource &sender) const {
+    return const_cast<RtmpSession *>(this)->shared_from_this();
+}
+
+toolkit::EventPoller::Ptr RtmpSession::getOwnerPoller(MediaSource &sender) {
+    return getPoller();
+}
+
+void RtmpSession::setSocketFlags(){
+    GET_CONFIG(int, merge_write_ms, General::kMergeWriteMS);
+    if (merge_write_ms > 0) {
+        //推流模式下，关闭TCP_NODELAY会增加推流端的延时，但是服务器性能将提高
+        SockUtil::setNoDelay(getSock()->rawFD(), false);
+        //播放模式下，开启MSG_MORE会增加延时，但是能提高发送性能
+        setSendFlags(SOCKET_DEFAULE_FLAGS | FLAG_MORE);
     }
-    _delayTask = fun;
-    _iTaskTimeLine = time(NULL) + delaySec;
 }
 
-void RtmpSession::cancelDelyaTask(){
-    _delayTask = nullptr;
+void RtmpSession::dumpMetadata(const AMFValue &metadata) {
+    if (metadata.type() != AMF_OBJECT && metadata.type() != AMF_ECMA_ARRAY) {
+        WarnL << "invalid metadata type:" << metadata.type();
+        return;
+    }
+    _StrPrinter printer;
+    metadata.object_for_each([&](const string &key, const AMFValue &val) {
+        printer << "\r\n" << key << "\t:" << val.to_string();
+    });
+    InfoL << _media_info.shortUrl() << (string) printer;
 }
-
-
 } /* namespace mediakit */

@@ -1,27 +1,11 @@
 ﻿/*
- * MIT License
+ * Copyright (c) 2016-present The ZLMediaKit project authors. All Rights Reserved.
  *
- * Copyright (c) 2016 xiongziliang <771730766@qq.com>
+ * This file is part of ZLMediaKit(https://github.com/ZLMediaKit/ZLMediaKit).
  *
- * This file is part of ZLMediaKit(https://github.com/xiongziliang/ZLMediaKit).
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Use of this source code is governed by MIT-like license that can be found in the
+ * LICENSE file in the root of the source tree. All contributing project authors
+ * may be found in the AUTHORS file in the root of the source tree.
  */
 
 #ifndef Http_HttpClient_h
@@ -31,301 +15,305 @@
 #include <string.h>
 #include <functional>
 #include <memory>
-#include "Rtsp/Rtsp.h"
 #include "Util/util.h"
+#include "Util/mini.h"
 #include "Network/TcpClient.h"
+#include "Common/Parser.h"
 #include "HttpRequestSplitter.h"
 #include "HttpCookie.h"
 #include "HttpChunkedSplitter.h"
-
-using namespace std;
-using namespace toolkit;
+#include "Common/strCoding.h"
+#include "HttpBody.h"
 
 namespace mediakit {
 
-class HttpArgs : public StrCaseMap {
+class HttpArgs : public std::map<std::string, toolkit::variant, StrCaseCompare> {
 public:
-    HttpArgs(){}
-    virtual ~HttpArgs(){}
-    string make() const {
-        string ret;
-        for(auto &pr : *this){
+    std::string make() const {
+        std::string ret;
+        for (auto &pr : *this) {
             ret.append(pr.first);
             ret.append("=");
-            ret.append(pr.second);
+            ret.append(strCoding::UrlEncodeComponent(pr.second));
             ret.append("&");
         }
-        if(ret.size()){
+        if (ret.size()) {
             ret.pop_back();
         }
         return ret;
     }
 };
 
-class HttpBody{
+class HttpClient : public toolkit::TcpClient, public HttpRequestSplitter {
 public:
-    typedef std::shared_ptr<HttpBody> Ptr;
-    HttpBody(){}
-    virtual ~HttpBody(){}
-    //剩余数据大小
-    virtual uint64_t remainSize() = 0;
-    virtual Buffer::Ptr readData() = 0;
-};
+    using HttpHeader = StrCaseMap;
+    using Ptr = std::shared_ptr<HttpClient>;
 
-class HttpStringBody : public HttpBody{
-public:
-    typedef std::shared_ptr<HttpStringBody> Ptr;
-    HttpStringBody(const string &str){
-        _str = str;
-    }
-    virtual ~HttpStringBody(){}
+    /**
+     * 发送http[s]请求
+     * @param url 请求url
+     * Send http[s] request
+     * @param url Request url
+     
+     * [AUTO-TRANSLATED:01b6c9ac]
+     */
+    virtual void sendRequest(const std::string &url);
 
-    uint64_t remainSize() override {
-        return _str.size();
-    }
-    Buffer::Ptr readData() override {
-        auto ret = std::make_shared<BufferString>(_str);
-        _str.clear();
-        return ret;
-    }
-private:
-    mutable string _str;
-};
+    /**
+     * 重置对象
+     * Reset object
+     
+     * [AUTO-TRANSLATED:d23b5bbb]
+     */
+    virtual void clear();
 
+    /**
+     * 设置http方法
+     * @param method GET/POST等
+     * Set http method
+     * @param method GET/POST etc.
+     
+     * [AUTO-TRANSLATED:5199546a]
+     */
+    void setMethod(std::string method);
 
-class HttpMultiFormBody : public HttpBody {
-public:
-    typedef std::shared_ptr<HttpMultiFormBody> Ptr;
-    HttpMultiFormBody(const StrCaseMap &args,const string &filePath,const string &boundary,uint32_t sliceSize = 4 * 1024){
-        _fp = fopen(filePath.data(),"rb");
-        if(!_fp){
-            throw std::invalid_argument(StrPrinter << "打开文件失败：" << filePath << " " << get_uv_errmsg());
-        }
-        auto fileName = filePath;
-        auto pos = filePath.rfind('/');
-        if(pos != string::npos){
-            fileName = filePath.substr(pos + 1);
-        }
-        _bodyPrefix = multiFormBodyPrefix(args,boundary,fileName);
-        _bodySuffix = multiFormBodySuffix(boundary);
-        _totalSize =  _bodyPrefix.size() + _bodySuffix.size() + fileSize(_fp);
-        _sliceSize = sliceSize;
-    }
-    virtual ~HttpMultiFormBody(){
-        fclose(_fp);
-    }
+    /**
+     * 覆盖http头
+     * @param header
+     * Override http header
+     * @param header
+     
+     * [AUTO-TRANSLATED:ea31a471]
+     */
+    void setHeader(HttpHeader header);
 
-    uint64_t remainSize() override {
-        return _totalSize - _offset;
-    }
+    HttpClient &addHeader(std::string key, std::string val, bool force = false);
 
-    Buffer::Ptr readData() override{
-        if(_bodyPrefix.size()){
-            auto ret = std::make_shared<BufferString>(_bodyPrefix);
-            _offset += _bodyPrefix.size();
-            _bodyPrefix.clear();
-            return ret;
-        }
+    /**
+     * 设置http content
+     * @param body http content
+     * Set http content
+     * @param body http content
+     
+     * [AUTO-TRANSLATED:9993580c]
+     */
+    void setBody(std::string body);
 
-        if(0 == feof(_fp)){
-            auto ret = std::make_shared<BufferRaw>(_sliceSize);
-            //读文件
-            int size;
-            do{
-                size = fread(ret->data(),1,_sliceSize,_fp);
-            }while(-1 == size && UV_EINTR == get_uv_error(false));
+    /**
+     * 设置http content
+     * @param body http content
+     * Set http content
+     * @param body http content
+     
+     * [AUTO-TRANSLATED:9993580c]
+     */
+    void setBody(HttpBody::Ptr body);
 
-            if(size == -1){
-                _offset = _totalSize;
-                WarnL << "fread failed:" << get_uv_errmsg();
-                return nullptr;
-            }
-            _offset += size;
-            ret->setSize(size);
-            return ret;
-        }
+    /**
+     * 获取回复，在收到完整回复后有效
+     * Get response, valid after receiving the complete response
+     
+     * [AUTO-TRANSLATED:b107995e]
+     */
+    const Parser &response() const;
 
-        if(_bodySuffix.size()){
-            auto ret = std::make_shared<BufferString>(_bodySuffix);
-            _offset = _totalSize;
-            _bodySuffix.clear();
-            return ret;
-        }
+    /**
+     * 获取回复header声明的body大小
+     * Get the body size declared in the response header
+     
+     * [AUTO-TRANSLATED:65f8e782]
+     */
+    ssize_t responseBodyTotalSize() const;
 
-        return nullptr;
-    }
+    /**
+     * 获取已经下载body的大小
+     * Get the size of the body that has been downloaded
+     
+     * [AUTO-TRANSLATED:a3cde7b4]
+     */
+    size_t responseBodySize() const;
 
-public:
-    static string multiFormBodyPrefix(const StrCaseMap &args,const string &boundary,const string &fileName){
-        string MPboundary = string("--") + boundary;
-        _StrPrinter body;
-        for(auto &pr : args){
-            body << MPboundary << "\r\n";
-            body << "Content-Disposition: form-data; name=\"" << pr.first << "\"\r\n\r\n";
-            body << pr.second << "\r\n";
-        }
-        body << MPboundary << "\r\n";
-        body << "Content-Disposition: form-data; name=\"" << "file" << "\";filename=\"" << fileName << "\"\r\n";
-        body << "Content-Type: application/octet-stream\r\n\r\n" ;
-        return body;
-    }
-    static string multiFormBodySuffix(const string &boundary){
-        string MPboundary = string("--") + boundary;
-        string endMPboundary = MPboundary + "--";
-        _StrPrinter body;
-        body << "\r\n" << endMPboundary;
-        return body;
-    }
+    /**
+     * 获取请求url
+     * Get the request url
+     
+     * [AUTO-TRANSLATED:cc7fe537]
+     */
+    const std::string &getUrl() const;
 
-    static uint64_t fileSize(FILE *fp) {
-        auto current = ftell(fp);
-        fseek(fp,0L,SEEK_END); /* 定位到文件末尾 */
-        auto end  = ftell(fp); /* 得到文件大小 */
-        fseek(fp,current,SEEK_SET);
-        return end - current;
-    }
+    /**
+     * 判断是否正在等待响应
+     * Determine if the response is pending
+     
+     * [AUTO-TRANSLATED:058719d7]
+     */
+    bool waitResponse() const;
 
-    static string multiFormContentType(const string &boundary){
-        return StrPrinter << "multipart/form-data; boundary=" << boundary;
-    }
-private:
-    FILE *_fp;
-    string _bodyPrefix;
-    string _bodySuffix;
-    uint64_t _offset = 0;
-    uint64_t _totalSize;
-    uint32_t _sliceSize;
-};
+    /**
+     * 判断是否为https
+     * Determine if it is https
+     
+     * [AUTO-TRANSLATED:9b3a0254]
+     */
+    bool isHttps() const;
 
+    /**
+     * 设置从发起连接到接收header完毕的延时，默认10秒
+     * 此参数必须大于0
+     * Set the delay from initiating the connection to receiving the header, default 10 seconds
+     * This parameter must be greater than 0
+     
+     * [AUTO-TRANSLATED:4cce3e85]
+     */
+    void setHeaderTimeout(size_t timeout_ms);
 
+    /**
+     * 设置接收body数据超时时间, 默认5秒
+     * 此参数可以用于处理超大body回复的超时问题
+     * 此参数可以等于0
+     * Set the timeout for receiving body data, default 5 seconds
+     * This parameter can be used to handle timeout issues for large body responses
+     * This parameter can be equal to 0
+     
+     * [AUTO-TRANSLATED:48585852]
+     */
+    void setBodyTimeout(size_t timeout_ms);
 
-class HttpClient : public TcpClient , public HttpRequestSplitter
-{
-public:
-    typedef StrCaseMap HttpHeader;
-    typedef std::shared_ptr<HttpClient> Ptr;
-    HttpClient();
-    virtual ~HttpClient();
-    virtual void sendRequest(const string &url,float fTimeOutSec);
+    /**
+     * 设置整个链接超时超时时间, 默认0
+     * 该值设置不为0后，HeaderTimeout和BodyTimeout无效
+     * Set the timeout for the entire link, default 0
+     * After this value is set to non-zero, HeaderTimeout and BodyTimeout are invalid
+     
+     * [AUTO-TRANSLATED:df094868]
+     */
+    void setCompleteTimeout(size_t timeout_ms);
 
-    virtual void clear(){
-        _header.clear();
-        _body.reset();
-        _method.clear();
-        _path.clear();
-        _parser.Clear();
-        _recvedBodySize = 0;
-        _totalBodySize = 0;
-        _aliveTicker.resetTime();
-        _fTimeOutSec = 0;
-        _chunkedSplitter.reset();
-        HttpRequestSplitter::reset();
-    }
+    /**
+     * 设置http代理url
+     * Set http proxy url
+     
+     * [AUTO-TRANSLATED:95df17e7]
+     */
+    void setProxyUrl(std::string proxy_url);
 
-    void setMethod(const string &method){
-        _method = method;
-    }
-    void setHeader(const HttpHeader &header){
-        _header = header;
-    }
-    HttpClient & addHeader(const string &key,const string &val,bool force = false){
-        if(!force){
-            _header.emplace(key,val);
-        }else{
-            _header[key] = val;
-        }
-        return *this;
-    }
-    void setBody(const string &body){
-        _body.reset(new HttpStringBody(body));
-    }
-    void setBody(const HttpBody::Ptr &body){
-        _body = body;
-    }
-    const string &responseStatus() const{
-        return _parser.Url();
-    }
-    const HttpHeader &responseHeader() const{
-        return _parser.getValues();
-    }
-    const Parser& response() const{
-        return _parser;
-    }
+    /**
+     * 当重用连接失败时, 是否允许重新发起请求
+     * If the reuse connection fails, whether to allow the request to be resent
+     * @param allow true:允许重新发起请求 / true: allow the request to be resent
+     * When the reuse connection fails, whether to allow the request to be resent
+     * @param allow true: allow the request to be resent
+     
+     * [AUTO-TRANSLATED:71bd8e67]
+     */
+    void setAllowResendRequest(bool allow);
+
 protected:
     /**
      * 收到http回复头
      * @param status 状态码，譬如:200 OK
      * @param headers http头
-     * @return 返回后续content的长度；-1:后续数据全是content；>=0:固定长度content
-     *          需要指出的是，在http头中带有Content-Length字段时，该返回值无效
+     * Receive http response header
+     * @param status Status code, such as: 200 OK
+     * @param headers http header
+     
+     * [AUTO-TRANSLATED:a685f8ef]
      */
-    virtual int64_t onResponseHeader(const string &status,const HttpHeader &headers){
-        DebugL << status;
-        //无Content-Length字段时默认后面全是content
-        return -1;
-    };
+    virtual void onResponseHeader(const std::string &status, const HttpHeader &headers) = 0;
 
     /**
      * 收到http conten数据
      * @param buf 数据指针
      * @param size 数据大小
-     * @param recvedSize 已收数据大小(包含本次数据大小),当其等于totalSize时将触发onResponseCompleted回调
-     * @param totalSize 总数据大小
+     * Receive http content data
+     * @param buf Data pointer
+     * @param size Data size
+     
+     * [AUTO-TRANSLATED:bee3bf62]
      */
-    virtual void onResponseBody(const char *buf,int64_t size,int64_t recvedSize,int64_t totalSize){
-        DebugL << size << " " <<  recvedSize << " " << totalSize;
-    };
+    virtual void onResponseBody(const char *buf, size_t size) = 0;
 
     /**
      * 接收http回复完毕,
+     * Receive http response complete,
+     
+     * [AUTO-TRANSLATED:b96ed715]
      */
-    virtual void onResponseCompleted(){
-    	DebugL;
-    }
+    virtual void onResponseCompleted(const toolkit::SockException &ex) = 0;
 
     /**
-     * 收到http回复数据回调
-     * @param data 数据指针
-     * @param size 数据大小
+     * 重定向事件
+     * @param url 重定向url
+     * @param temporary 是否为临时重定向
+     * @return 是否继续
+     * Redirect event
+     * @param url Redirect url
+     * @param temporary Whether it is a temporary redirect
+     * @return Whether to continue
+     * [AUTO-TRANSLATED:b64d5f8b]
      */
-    virtual void onRecvBytes(const char *data,int size);
+    virtual bool onRedirectUrl(const std::string &url, bool temporary) { return true; };
 
-    /**
-     * http链接断开回调
-     * @param ex 断开原因
-     */
-    virtual void onDisconnect(const SockException &ex){}
-
-    //HttpRequestSplitter override
-    int64_t onRecvHeader(const char *data,uint64_t len) override ;
-    void onRecvContent(const char *data,uint64_t len) override;
-
-    //在连接服务器前调用一次
-    virtual void onBeforeConnect(string &strUrl, uint16_t &iPort,float &fTimeOutSec) {};
 protected:
-    virtual void onConnect(const SockException &ex) override;
-    virtual void onRecv(const Buffer::Ptr &pBuf) override;
-    virtual void onErr(const SockException &ex) override;
-    virtual void onSend() override;
-    virtual void onManager() override;
+    //// HttpRequestSplitter override ////
+    ssize_t onRecvHeader(const char *data, size_t len) override;
+    void onRecvContent(const char *data, size_t len) override;
+
+    //// TcpClient override ////
+    void onConnect(const toolkit::SockException &ex) override;
+    void onRecv(const toolkit::Buffer::Ptr &pBuf) override;
+    void onError(const toolkit::SockException &ex) override;
+    void onFlush() override;
+    void onManager() override;
+
+    void clearResponse();
+
+    bool checkProxyConnected(const char *data, size_t len);
+    bool isUsedProxy() const;
+    bool isProxyConnected() const;
+
 private:
-    void onResponseCompleted_l();
-    void checkCookie(HttpHeader &headers );
-protected:
-    bool _isHttps;
+    void onResponseCompleted_l(const toolkit::SockException &ex);
+    void onConnect_l(const toolkit::SockException &ex);
+    void checkCookie(HttpHeader &headers);
+
 private:
-    HttpHeader _header;
-    HttpBody::Ptr _body;
-    string _method;
-    string _path;
-    //recv
-    int64_t _recvedBodySize;
-    int64_t _totalBodySize;
+    //for http response
+    bool _complete = false;
+    bool _header_recved = false;
+    bool _http_persistent = true;
+    bool _allow_resend_request = false;
+    size_t _recved_body_size;
+    ssize_t _total_body_size;
     Parser _parser;
-    string _lastHost;
-    Ticker _aliveTicker;
-    float _fTimeOutSec = 0;
-    std::shared_ptr<HttpChunkedSplitter> _chunkedSplitter;
+    std::shared_ptr<HttpChunkedSplitter> _chunked_splitter;
+
+    //for request args
+    bool _is_https;
+    std::string _url;
+    HttpHeader _user_set_header;
+    HttpBody::Ptr _body;
+    std::string _method;
+    std::string _last_host;
+
+    //for this request
+    std::string _path;
+    HttpHeader _header;
+
+    //for timeout
+    size_t _wait_header_ms = 10 * 1000;
+    size_t _wait_body_ms = 10 * 1000;
+    size_t _wait_complete_ms = 0;
+    toolkit::Ticker _wait_header;
+    toolkit::Ticker _wait_body;
+    toolkit::Ticker _wait_complete;
+
+    bool _used_proxy = false;
+    bool _proxy_connected = false;
+    uint16_t _proxy_port;
+    std::string _proxy_url;
+    std::string _proxy_host;
+    std::string _proxy_auth;
 };
 
 } /* namespace mediakit */

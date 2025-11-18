@@ -1,152 +1,155 @@
 ﻿/*
- * MIT License
+ * Copyright (c) 2016-present The ZLMediaKit project authors. All Rights Reserved.
  *
- * Copyright (c) 2016 xiongziliang <771730766@qq.com>
+ * This file is part of ZLMediaKit(https://github.com/ZLMediaKit/ZLMediaKit).
  *
- * This file is part of ZLMediaKit(https://github.com/xiongziliang/ZLMediaKit).
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Use of this source code is governed by MIT-like license that can be found in the
+ * LICENSE file in the root of the source tree. All contributing project authors
+ * may be found in the AUTHORS file in the root of the source tree.
  */
 
 #include "Common/config.h"
 #include "RtpReceiver.h"
 
-#define POP_HEAD(trackidx) \
-		auto it = _amapRtpSort[trackidx].begin(); \
-		onRtpSorted(it->second, trackidx); \
-		_amapRtpSort[trackidx].erase(it);
-
-#   define AV_RB16(x)                           \
-    ((((const uint8_t*)(x))[0] << 8) |          \
-      ((const uint8_t*)(x))[1])
-
-
 namespace mediakit {
 
-RtpReceiver::RtpReceiver() {}
-RtpReceiver::~RtpReceiver() {}
-
-bool RtpReceiver::handleOneRtp(int iTrackidx,SdpTrack::Ptr &track, unsigned char *pucData, unsigned int uiLen) {
-    auto pt_ptr=_pktPool.obtain();
-    auto &rtppt=*pt_ptr;
-    rtppt.interleaved = track->_interleaved;
-    rtppt.length = uiLen + 4;
-
-    rtppt.mark = pucData[1] >> 7;
-    rtppt.PT = pucData[1] & 0x7F;
-    //序列号
-    memcpy(&rtppt.sequence,pucData+2,2);//内存对齐
-    rtppt.sequence = ntohs(rtppt.sequence);
-    //时间戳
-    memcpy(&rtppt.timeStamp, pucData+4, 4);//内存对齐
-
-    if(!track->_samplerate){
-        return false;
-    }
-    //时间戳转换成毫秒
-    rtppt.timeStamp = ntohl(rtppt.timeStamp) * 1000LL / track->_samplerate;
-    //ssrc
-    memcpy(&rtppt.ssrc,pucData+8,4);//内存对齐
-    rtppt.ssrc = ntohl(rtppt.ssrc);
-    rtppt.type = track->_type;
-    if (track->_ssrc == 0) {
-        track->_ssrc = rtppt.ssrc;
-        //保存SSRC
-    } else if (track->_ssrc != rtppt.ssrc) {
-        //ssrc错误
-        WarnL << "ssrc错误";
-        if (_aui32SsrcErrorCnt[iTrackidx]++ > 10) {
-            track->_ssrc = rtppt.ssrc;
-            WarnL << "ssrc更换!";
-        }
-        return false;
-    }
-    _aui32SsrcErrorCnt[iTrackidx] = 0;
-
-    rtppt.payload[0] = '$';
-    rtppt.payload[1] = rtppt.interleaved;
-    rtppt.payload[2] = (uiLen & 0xFF00) >> 8;
-    rtppt.payload[3] = (uiLen & 0x00FF);
-
-    rtppt.offset 	= 16;
-    int csrc     	= pucData[0] & 0x0f;
-    int ext      	= pucData[0] & 0x10;
-    rtppt.offset 	+= 4 * csrc;
-    if (ext) {
-        if(uiLen < rtppt.offset){
-            return false;
-        }
-        /* calculate the header extension length (stored as number of 32-bit words) */
-        ext = (AV_RB16(pucData + rtppt.offset - 2) + 1) << 2;
-        rtppt.offset += ext;
-    }
-
-    memcpy(rtppt.payload + 4, pucData, uiLen);
-
-    /////////////////////////////////RTP排序逻辑///////////////////////////////////
-    if(rtppt.sequence != (uint16_t)(_aui16LastSeq[iTrackidx] + 1) && _aui16LastSeq[iTrackidx] != 0){
-        //包乱序或丢包
-        _aui64SeqOkCnt[iTrackidx] = 0;
-        _abSortStarted[iTrackidx] = true;
-        //WarnL << "包乱序或丢包:" << trackidx <<" " << rtppt.sequence << " " << _aui16LastSeq[trackidx];
-    }else{
-        //正确序列的包
-        _aui64SeqOkCnt[iTrackidx]++;
-    }
-    _aui16LastSeq[iTrackidx] = rtppt.sequence;
-
-    //开始排序缓存
-    if (_abSortStarted[iTrackidx]) {
-        _amapRtpSort[iTrackidx].emplace(rtppt.sequence, pt_ptr);
-        GET_CONFIG_AND_REGISTER(uint32_t,clearCount,Rtp::kClearCount);
-        GET_CONFIG_AND_REGISTER(uint32_t,maxRtpCount,Rtp::kMaxRtpCount);
-        if (_aui64SeqOkCnt[iTrackidx] >= clearCount) {
-            //网络环境改善，需要清空排序缓存
-            _aui64SeqOkCnt[iTrackidx] = 0;
-            _abSortStarted[iTrackidx] = false;
-            while (_amapRtpSort[iTrackidx].size()) {
-                POP_HEAD(iTrackidx)
-            }
-        } else if (_amapRtpSort[iTrackidx].size() >= maxRtpCount) {
-            //排序缓存溢出
-            POP_HEAD(iTrackidx)
-        }
-    }else{
-        //正确序列
-        onRtpSorted(pt_ptr, iTrackidx);
-    }
-    //////////////////////////////////////////////////////////////////////////////////
-    return true;
+RtpTrack::RtpTrack() {
+    setOnSort([this](uint16_t seq, RtpPacket::Ptr packet) {
+        onRtpSorted(std::move(packet));
+    });
 }
 
-void RtpReceiver::clear() {
-    CLEAR_ARR(_aui16LastSeq)
-    CLEAR_ARR(_aui32SsrcErrorCnt)
-    CLEAR_ARR(_aui64SeqOkCnt)
-    CLEAR_ARR(_abSortStarted)
-
-    _amapRtpSort[0].clear();
-    _amapRtpSort[1].clear();
+uint32_t RtpTrack::getSSRC() const {
+    return _ssrc;
 }
 
-void RtpReceiver::setPoolSize(int size) {
-    _pktPool.setSize(size);
+void RtpTrack::clear() {
+    _ssrc = 0;
+    _ssrc_alive.resetTime();
+    PacketSortor<RtpPacket::Ptr>::clear();
+}
+
+RtpPacket::Ptr RtpTrack::inputRtp(TrackType type, int sample_rate, uint8_t *ptr, size_t len) {
+    if (len < RtpPacket::kRtpHeaderSize) {
+        throw BadRtpException("rtp size less than 12");
+    }
+    GET_CONFIG(uint32_t, rtpMaxSize, Rtp::kRtpMaxSize);
+    if (len > 1024 * rtpMaxSize) {
+        WarnL << "超大的rtp包:" << len << " > " << 1024 * rtpMaxSize;
+        return nullptr;
+    }
+    if (!sample_rate) {
+        // 无法把时间戳转换成毫秒  [AUTO-TRANSLATED:ec2d97b6]
+        // Unable to convert timestamp to milliseconds
+        return nullptr;
+    }
+    RtpHeader *header = (RtpHeader *) ptr;
+    if (header->version != RtpPacket::kRtpVersion) {
+        throw BadRtpException("invalid rtp version");
+    }
+    if (header->getPayloadSize(len) < 0) {
+        // rtp有效负载小于0，非法  [AUTO-TRANSLATED:07eb3ec3]
+        // RTP payload is less than 0, illegal
+        throw BadRtpException("invalid rtp payload size");
+    }
+
+    // 比对缓存ssrc  [AUTO-TRANSLATED:206cb66f]
+    // Compare cache ssrc
+    auto ssrc = ntohl(header->ssrc);
+
+    if (_pt == 0xFF) {
+        _pt = header->pt;
+    } else if (header->pt != _pt) {
+        //TraceL << "rtp pt mismatch:" << (int) header->pt << " !=" << (int) _pt;
+        return nullptr;
+    }
+
+    if (!_ssrc) {
+        // 记录并锁定ssrc  [AUTO-TRANSLATED:29452029]
+        // Record and lock ssrc
+        _ssrc = ssrc;
+        _ssrc_alive.resetTime();
+    } else if (_ssrc == ssrc) {
+        // ssrc匹配正确,刷新计时器  [AUTO-TRANSLATED:266518e6]
+        // SSRC matches correctly, refresh timer
+        _ssrc_alive.resetTime();
+    } else {
+        // ssrc错误  [AUTO-TRANSLATED:b967d497]
+        // SSRC error
+        if (_ssrc_alive.elapsedTime() < 3 * 1000) {
+            // 接收正确ssrc的rtp在10秒内，那么我们认为存在多路rtp,忽略掉ssrc不匹配的rtp  [AUTO-TRANSLATED:2f98c2b5]
+            // If the RTP with the correct SSRC is received within 10 seconds, we consider it to be multi-path RTP, and ignore the RTP with mismatched SSRC
+            WarnL << "ssrc mismatch, rtp dropped:" << ssrc << " != " << _ssrc;
+            return nullptr;
+        }
+        InfoL << "rtp ssrc changed:" << _ssrc << " -> " << ssrc;
+        _ssrc = ssrc;
+        _ssrc_alive.resetTime();
+    }
+
+    auto rtp = RtpPacket::create();
+    // 需要添加4个字节的rtp over tcp头  [AUTO-TRANSLATED:a37d639b]
+    // Need to add 4 bytes of RTP over TCP header
+    rtp->setCapacity(RtpPacket::kRtpTcpHeaderSize + len);
+    rtp->setSize(RtpPacket::kRtpTcpHeaderSize + len);
+    rtp->sample_rate = sample_rate;
+    rtp->type = type;
+
+    // 赋值4个字节的rtp over tcp头  [AUTO-TRANSLATED:eeb990a9]
+    // Assign 4 bytes of RTP over TCP header
+    uint8_t *data = (uint8_t *) rtp->data();
+    data[0] = '$';
+    data[1] = 2 * type;
+    data[2] = (len >> 8) & 0xFF;
+    data[3] = len & 0xFF;
+    // 拷贝rtp  [AUTO-TRANSLATED:3a2466c2]
+    // Copy RTP
+    memcpy(&data[4], ptr, len);
+    if (_disable_ntp) {
+        // 不支持ntp时间戳，例如国标推流，那么直接使用rtp时间戳  [AUTO-TRANSLATED:20085979]
+        // Does not support NTP timestamp, such as national standard streaming, so directly use RTP timestamp
+        rtp->ntp_stamp = rtp->getStamp() * uint64_t(1000) / sample_rate;
+    } else {
+        // 设置ntp时间戳  [AUTO-TRANSLATED:5e60d5cf]
+        // Set NTP timestamp
+        rtp->ntp_stamp = _ntp_stamp.getNtpStamp(rtp->getStamp(), sample_rate);
+    }
+    onBeforeRtpSorted(rtp);
+    sortPacket(rtp->getSeq(), rtp);
+    return rtp;
+}
+
+void RtpTrack::setNtpStamp(uint32_t rtp_stamp, uint64_t ntp_stamp_ms) {
+    _disable_ntp = rtp_stamp == 0 && ntp_stamp_ms == 0;
+    if (!_disable_ntp) {
+        _ntp_stamp.setNtpStamp(rtp_stamp, ntp_stamp_ms);
+    }
+}
+
+void RtpTrack::setPayloadType(uint8_t pt) {
+    _pt = pt;
+}
+
+////////////////////////////////////////////////////////////////////////////////////
+
+void RtpTrackImp::setOnSorted(OnSorted cb) {
+    _on_sorted = std::move(cb);
+}
+
+void RtpTrackImp::setBeforeSorted(BeforeSorted cb) {
+    _on_before_sorted = std::move(cb);
+}
+
+void RtpTrackImp::onRtpSorted(RtpPacket::Ptr rtp) {
+    if (_on_sorted) {
+        _on_sorted(std::move(rtp));
+    }
+}
+
+void RtpTrackImp::onBeforeRtpSorted(const RtpPacket::Ptr &rtp) {
+    if (_on_before_sorted) {
+        _on_before_sorted(rtp);
+    }
 }
 
 }//namespace mediakit

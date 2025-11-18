@@ -1,27 +1,11 @@
 ﻿/*
- * MIT License
+ * Copyright (c) 2016-present The ZLMediaKit project authors. All Rights Reserved.
  *
- * Copyright (c) 2016 xiongziliang <771730766@qq.com>
+ * This file is part of ZLMediaKit(https://github.com/ZLMediaKit/ZLMediaKit).
  *
- * This file is part of ZLMediaKit(https://github.com/xiongziliang/ZLMediaKit).
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Use of this source code is governed by MIT-like license that can be found in the
+ * LICENSE file in the root of the source tree. All contributing project authors
+ * may be found in the AUTHORS file in the root of the source tree.
  */
 
 #ifndef RTSP_UDPSERVER_H_
@@ -31,33 +15,29 @@
 #include <mutex>
 #include <memory>
 #include <unordered_map>
-#include <unordered_set>
-#include "Util/util.h"
-#include "Util/logger.h"
 #include "Network/Socket.h"
-
-using namespace std;
-using namespace toolkit;
 
 namespace mediakit {
 
 class UDPServer : public std::enable_shared_from_this<UDPServer> {
 public:
-	typedef function< bool(int, const Buffer::Ptr &, struct sockaddr *)> onRecvData;
-	~UDPServer();
-	static UDPServer &Instance();
-	Socket::Ptr getSock(const char *strLocalIp, int iTrackIndex,uint16_t iLocalPort = 0);
-	void listenPeer(const char *strPeerIp, void *pSelf, const onRecvData &cb);
-	void stopListenPeer(const char *strPeerIp, void *pSelf);
-private:
-	UDPServer();
-	void onRcvData(int iTrackId, const Buffer::Ptr &pBuf,struct sockaddr *pPeerAddr);
-	void onErr(const string &strKey,const SockException &err);
-	unordered_map<string, Socket::Ptr> _mapUpdSock;
-	mutex _mtxUpdSock;
+    using onRecvData = std::function<bool(int intervaled, const toolkit::Buffer::Ptr &buffer, struct sockaddr *peer_addr)> ;
+    ~UDPServer();
+    static UDPServer &Instance();
+    toolkit::Socket::Ptr getSock(toolkit::SocketHelper &helper, const char *local_ip, int interleaved, uint16_t local_port = 0);
+    void listenPeer(const char *peer_ip, void *obj, const onRecvData &cb);
+    void stopListenPeer(const char *peer_ip, void *obj);
 
-	unordered_map<string, unordered_map<void *, onRecvData> > _mapDataHandler;
-	mutex _mtxDataHandler;
+private:
+    UDPServer();
+    void onRecv(int interleaved, const toolkit::Buffer::Ptr &buf, struct sockaddr *peer_addr);
+    void onErr(const std::string &strKey, const toolkit::SockException &err);
+
+private:
+    std::mutex _mtx_udp_sock;
+    std::mutex _mtx_on_recv;
+    std::unordered_map<std::string, toolkit::Socket::Ptr> _udp_sock_map;
+    std::unordered_map<std::string, std::unordered_map<void *, onRecvData> > _on_recv_map;
 };
 
 } /* namespace mediakit */

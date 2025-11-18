@@ -1,27 +1,11 @@
 ﻿/*
- * MIT License
+ * Copyright (c) 2016-present The ZLMediaKit project authors. All Rights Reserved.
  *
- * Copyright (c) 2016 xiongziliang <771730766@qq.com>
+ * This file is part of ZLMediaKit(https://github.com/ZLMediaKit/ZLMediaKit).
  *
- * This file is part of ZLMediaKit(https://github.com/xiongziliang/ZLMediaKit).
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Use of this source code is governed by MIT-like license that can be found in the
+ * LICENSE file in the root of the source tree. All contributing project authors
+ * may be found in the AUTHORS file in the root of the source tree.
  */
 
 #ifndef SRC_RTP_RTPPARSERTESTER_H_
@@ -30,64 +14,97 @@
 #include <memory>
 #include <algorithm>
 #include <functional>
-#include "Common/config.h"
 #include "RtspPlayer.h"
-#include "RtspMuxer/RtspDemuxer.h"
-#include "Poller/Timer.h"
-#include "Util/TimeTicker.h"
-
-using namespace std;
-using namespace toolkit;
+#include "RtspDemuxer.h"
+#include "RtspMediaSource.h"
 
 namespace mediakit {
 
-class RtspPlayerImp: public PlayerImp<RtspPlayer,RtspDemuxer> {
+class RtspPlayerImp : public PlayerImp<RtspPlayer, PlayerBase> ,private TrackListener {
 public:
-	typedef std::shared_ptr<RtspPlayerImp> Ptr;
-	RtspPlayerImp(){};
-	virtual ~RtspPlayerImp(){
-        DebugL<<endl;
-    };
-    float getProgress() const override{
-        if(getDuration() > 0){
+    using Ptr = std::shared_ptr<RtspPlayerImp>;
+    using Super = PlayerImp<RtspPlayer, PlayerBase>;
+
+    RtspPlayerImp(const toolkit::EventPoller::Ptr &poller) : Super(poller) {}
+
+    ~RtspPlayerImp() override {
+        DebugL;
+    }
+
+    float getProgress() const override {
+        if (getDuration() > 0) {
             return getProgressMilliSecond() / (getDuration() * 1000);
         }
         return PlayerBase::getProgress();
-        
-    };
-    void seekTo(float fProgress) override{
-        fProgress = MAX(float(0),MIN(fProgress,float(1.0)));
-        seekToMilliSecond(fProgress * getDuration() * 1000);
-    };
-private:
-	//派生类回调函数
-	bool onCheckSDP(const string &sdp, const SdpAttr &sdpAttr) override {
-		_pRtspMediaSrc = dynamic_pointer_cast<RtspMediaSource>(_pMediaSrc);
-		if(_pRtspMediaSrc){
-			_pRtspMediaSrc->onGetSDP(sdp);
-		}
-        _parser.reset(new RtspDemuxer(sdpAttr));
-        return true;
-	}
-	void onRecvRTP(const RtpPacket::Ptr &rtppt, const SdpTrack::Ptr &track) override {
-        if(_pRtspMediaSrc){
-            _pRtspMediaSrc->onWrite(rtppt,true);
+    }
+
+    uint32_t getProgressPos() const override {
+        if (getDuration() > 0) {
+            return getProgressMilliSecond();
         }
-        _parser->inputRtp(rtppt);
-
-        //由于我们重载isInited方法强制认为一旦获取sdp那么就初始化Track成功，
-        //所以我们不需要在后续检验是否初始化成功
-        //checkInited(0);
+        return PlayerBase::getProgressPos();
     }
 
-    bool isInited(int analysisMs) override{
-	    //rtsp是通过sdp来完成track的初始化的，所以我们强制返回true，
-        //认为已经初始化完毕，这样可以提高rtsp打开速度
-        return true;
+    void seekTo(float fProgress) override {
+        fProgress = MAX(float(0), MIN(fProgress, float(1.0)));
+        seekToMilliSecond((uint32_t) (fProgress * getDuration() * 1000));
     }
+
+    void seekTo(uint32_t seekPos) override {
+        uint32_t pos = MAX(float(0), MIN(seekPos, getDuration())) * 1000;
+        seekToMilliSecond(pos);
+    }
+
+    float getDuration() const override;
+
+    std::vector<Track::Ptr> getTracks(bool ready = true) const override;
+
+    size_t getRecvSpeed() override {
+        size_t ret = TcpClient::getRecvSpeed();
+        for (auto &rtp : _rtp_sock) {
+            if (rtp) {
+                ret += rtp->getRecvSpeed();
+            }
+        }
+        for (auto &rtcp : _rtcp_sock) {
+            if (rtcp) {
+                ret += rtcp->getRecvSpeed();
+            }
+        }
+        return ret;
+    }
+
+    size_t getRecvTotalBytes() override {
+        size_t ret = TcpClient::getRecvTotalBytes();
+        for (auto &rtp : _rtp_sock) {
+            if (rtp) {
+                ret += rtp->getRecvTotalBytes();
+            }
+        }
+        for (auto &rtcp : _rtcp_sock) {
+            if (rtcp) {
+                ret += rtcp->getRecvTotalBytes();
+            }
+        }
+        return ret;
+    }
+
 private:
-	RtspMediaSource::Ptr _pRtspMediaSrc;
-    
+    // 派生类回调函数  [AUTO-TRANSLATED:61e20903]
+    // Derived class callback function
+    bool onCheckSDP(const std::string &sdp) override;
+
+    void onRecvRTP(RtpPacket::Ptr rtp, const SdpTrack::Ptr &track) override;
+
+    void onPlayResult(const toolkit::SockException &ex) override;
+
+    bool addTrack(const Track::Ptr &track) override { return true; }
+
+    void addTrackCompleted() override;
+
+private:
+    RtspDemuxer::Ptr _demuxer;
+    RtspMediaSource::Ptr _rtsp_media_src;
 };
 
 } /* namespace mediakit */

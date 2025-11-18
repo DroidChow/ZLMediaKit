@@ -1,27 +1,11 @@
 ﻿/*
- * MIT License
+ * Copyright (c) 2016-present The ZLMediaKit project authors. All Rights Reserved.
  *
- * Copyright (c) 2016 xiongziliang <771730766@qq.com>
+ * This file is part of ZLMediaKit(https://github.com/ZLMediaKit/ZLMediaKit).
  *
- * This file is part of ZLMediaKit(https://github.com/xiongziliang/ZLMediaKit).
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Use of this source code is governed by MIT-like license that can be found in the
+ * LICENSE file in the root of the source tree. All contributing project authors
+ * may be found in the AUTHORS file in the root of the source tree.
  */
 
 #ifndef SRC_RTSPPLAYER_RTSPPLAYER_H_TXT_
@@ -29,45 +13,50 @@
 
 #include <string>
 #include <memory>
-#include "Rtsp.h"
-#include "RtspSession.h"
-#include "RtspMediaSource.h"
-#include "Player/PlayerBase.h"
-#include "Util/util.h"
-#include "Util/logger.h"
 #include "Util/TimeTicker.h"
 #include "Poller/Timer.h"
 #include "Network/Socket.h"
+#include "Player/PlayerBase.h"
 #include "Network/TcpClient.h"
 #include "RtspSplitter.h"
 #include "RtpReceiver.h"
-
-using namespace std;
-using namespace toolkit;
+#include "Rtcp/RtcpContext.h"
 
 namespace mediakit {
 
-//实现了rtsp播放器协议部分的功能
-class RtspPlayer: public PlayerBase,public TcpClient, public RtspSplitter, public RtpReceiver {
+// 实现了rtsp播放器协议部分的功能，及数据接收功能  [AUTO-TRANSLATED:c1ed5c0f]
+// Implemented the rtsp player protocol part functionality, and data receiving functionality
+class RtspPlayer : public PlayerBase, public toolkit::TcpClient, public RtspSplitter, public RtpReceiver {
 public:
-	typedef std::shared_ptr<RtspPlayer> Ptr;
+    using Ptr = std::shared_ptr<RtspPlayer>;
 
-	RtspPlayer();
-	virtual ~RtspPlayer(void);
-	void play(const char* strUrl) override;
-	void pause(bool bPause) override;
-	void teardown() override;
-	float getPacketLossRate(TrackType type) const override;
+    RtspPlayer(const toolkit::EventPoller::Ptr &poller);
+    ~RtspPlayer() override;
+
+    void play(const std::string &strUrl) override;
+    void pause(bool pause) override;
+    void speed(float speed) override;
+    void teardown() override;
+    float getPacketLossRate(TrackType type) const override;
+
+    size_t getRecvSpeed() override;
+    size_t getRecvTotalBytes() override;
+
 protected:
-	//派生类回调函数
-	virtual bool onCheckSDP(const string &strSdp, const SdpAttr &sdpAttr) = 0;
-	virtual void onRecvRTP(const RtpPacket::Ptr &pRtppt, const SdpTrack::Ptr &track) = 0;
+    // 派生类回调函数  [AUTO-TRANSLATED:61e20903]
+    // Derived class callback function
+    virtual bool onCheckSDP(const std::string &sdp) = 0;
+    virtual void onRecvRTP(RtpPacket::Ptr rtp, const SdpTrack::Ptr &track) = 0;
     uint32_t getProgressMilliSecond() const;
     void seekToMilliSecond(uint32_t ms);
 
     /**
      * 收到完整的rtsp包回调，包括sdp等content数据
      * @param parser rtsp包
+     * Callback for receiving a complete rtsp packet, including sdp and other content data
+     * @param parser rtsp packet
+     
+     * [AUTO-TRANSLATED:4d3c2056]
      */
     void onWholeRtspPacket(Parser &parser) override ;
 
@@ -75,75 +64,148 @@ protected:
      * 收到rtp包回调
      * @param data
      * @param len
+     * Callback for receiving rtp packet
+     * @param data
+     * @param len
+     
+     * [AUTO-TRANSLATED:c8f7c9bb]
      */
-    void onRtpPacket(const char *data,uint64_t len) override ;
+    void onRtpPacket(const char *data,size_t len) override ;
 
     /**
      * rtp数据包排序后输出
-     * @param rtppt rtp数据包
-     * @param trackidx track索引
+     * @param rtp rtp数据包
+     * @param track_idx track索引
+     * Output rtp data packets after sorting
+     * @param rtp rtp data packet
+     * @param track_idx track index
+     
+     * [AUTO-TRANSLATED:8f9ca364]
      */
-	void onRtpSorted(const RtpPacket::Ptr &rtppt, int trackidx) override;
-private:
-	void onShutdown_l(const SockException &ex);
-	void onRecvRTP_l(const RtpPacket::Ptr &pRtppt, const SdpTrack::Ptr &track);
-	void onPlayResult_l(const SockException &ex);
+    void onRtpSorted(RtpPacket::Ptr rtp, int track_idx) override;
 
-    int getTrackIndexByControlSuffix(const string &controlSuffix) const;
+    /**
+     * 解析出rtp但还未排序
+     * @param rtp rtp数据包
+     * @param track_index track索引
+     * Parse out rtp but not yet sorted
+     * @param rtp rtp data packet
+     * @param track_index track index
+     
+     * [AUTO-TRANSLATED:c1636911]
+     */
+    void onBeforeRtpSorted(const RtpPacket::Ptr &rtp, int track_index) override;
+
+    /**
+     * 收到RTCP包回调
+     * @param track_idx track索引
+     * @param track sdp相关信息
+     * @param data rtcp内容
+     * @param len rtcp内容长度
+     * Callback for receiving RTCP packet
+     * @param track_idx track index
+     * @param track sdp related information
+     * @param data rtcp content
+     * @param len rtcp content length
+     
+     * [AUTO-TRANSLATED:1a2cfa4f]
+     */
+    virtual void onRtcpPacket(int track_idx, SdpTrack::Ptr &track, uint8_t *data, size_t len);
+
+    /////////////TcpClient override/////////////
+    void onConnect(const toolkit::SockException &err) override;
+    void onRecv(const toolkit::Buffer::Ptr &buf) override;
+    void onError(const toolkit::SockException &ex) override;
+
+private:
+    void onPlayResult_l(const toolkit::SockException &ex , bool handshake_done);
+
+    int getTrackIndexByPT(int pt) const;
     int getTrackIndexByInterleaved(int interleaved) const;
-	int getTrackIndexByTrackType(TrackType trackId) const;
+    int getTrackIndexByTrackType(TrackType track_type) const;
 
-	void play(const char* strUrl, const char *strUser, const char *strPwd,  eRtpType eType);
-	void onConnect(const SockException &err) override;
-	void onRecv(const Buffer::Ptr &pBuf) override;
-	void onErr(const SockException &ex) override;
+    void handleResSETUP(const Parser &parser, unsigned int track_idx);
+    void handleResDESCRIBE(const Parser &parser);
+    bool handleAuthenticationFailure(const std::string &wwwAuthenticateParamsStr);
+    void handleResPAUSE(const Parser &parser, int type);
+    using send_method_handler = void (RtspPlayer::*)(void);
+    bool handleResponse(const std::string &cmd, const Parser &parser, send_method_handler handler);
 
-	void handleResSETUP(const Parser &parser, unsigned int uiTrackIndex);
-	void handleResDESCRIBE(const Parser &parser);
-	bool handleAuthenticationFailure(const string &wwwAuthenticateParamsStr);
-	void handleResPAUSE(const Parser &parser, bool bPause);
+    void sendOptions();
+    void sendSetup(unsigned int track_idx);
+    void sendPause(int type , uint32_t ms);
+    void sendDescribe();
+    void sendTeardown();
+    void sendKeepAlive();
+    void sendRtspRequest(const std::string &cmd, const std::string &url ,const StrCaseMap &header = StrCaseMap());
+    void sendRtspRequest(const std::string &cmd, const std::string &url ,const std::initializer_list<std::string> &header);
+    void createUdpSockIfNecessary(int track_idx);
 
-	//发送SETUP命令
-    bool sendSetup(unsigned int uiTrackIndex);
-    bool sendPause(bool bPause,uint32_t ms);
-	bool sendOptions();
-	bool sendDescribe();
-
-    bool sendRtspRequest(const string &cmd, const string &url ,const StrCaseMap &header = StrCaseMap());
-	bool sendRtspRequest(const string &cmd, const string &url ,const std::initializer_list<string> &header);
 private:
-	string _strUrl;
-	SdpAttr _sdpAttr;
-	vector<SdpTrack::Ptr> _aTrackInfo;
+    // 是否为性能测试模式  [AUTO-TRANSLATED:1fde8234]
+    // Whether it is performance test mode
+    bool _benchmark_mode = false;
+    // 轮流发送rtcp与GET_PARAMETER保活  [AUTO-TRANSLATED:5b6f9c37]
+    // Send rtcp and GET_PARAMETER keep-alive in turn
+    bool _send_rtcp[2] = {true, true};
 
-	function<void(const Parser&)> _onHandshake;
-	Socket::Ptr _apUdpSock[2];
-	//rtsp info
-	string _strSession;
-	unsigned int _uiCseq = 1;
-	string _strContentBase;
-	eRtpType _eType = RTP_TCP;
+    // 心跳类型  [AUTO-TRANSLATED:c22abb05]
+    // Heartbeat type
+    uint32_t _beat_type = 0;
+    // 心跳保护间隔  [AUTO-TRANSLATED:de16d9c9]
+    // Heartbeat protection interval
+    uint32_t _beat_interval_ms = 0;
 
-	/* 丢包率统计需要用到的参数 */
-	uint16_t _aui16FirstSeq[2] = { 0 , 0};
-	uint16_t _aui16NowSeq[2] = { 0 , 0 };
-	uint64_t _aui64RtpRecv[2] = { 0 , 0};
+    std::string _play_url;
+    // rtsp开始倍速  [AUTO-TRANSLATED:9ab84508]
+    // Rtsp start speed
+    float _speed = 0.0f;
+    std::vector<SdpTrack::Ptr> _sdp_track;
+    std::function<void(const Parser&)> _on_response;
+ protected:   
+    // RTP端口,trackid idx 为数组下标  [AUTO-TRANSLATED:77c186bb]
+    // RTP port, trackid idx is the array subscript
+    toolkit::Socket::Ptr _rtp_sock[2];
+    // RTCP端口,trackid idx 为数组下标  [AUTO-TRANSLATED:446a7861]
+    // RTCP port, trackid idx is the array subscript
+    toolkit::Socket::Ptr _rtcp_sock[2];
 
-	//超时功能实现
-	Ticker _rtpTicker;
-	std::shared_ptr<Timer> _pPlayTimer;
-	std::shared_ptr<Timer> _pRtpTimer;
-	//心跳定时器
-	std::shared_ptr<Timer> _pBeatTimer;
-    
-    //播放进度控制,单位毫秒
-    uint32_t _iSeekTo = 0;
+private:
+    // rtsp鉴权相关  [AUTO-TRANSLATED:947dc6a3]
+    // Rtsp authentication related
+    std::string _md5_nonce;
+    std::string _realm;
+    //rtsp info
+    std::string _session_id;
+    uint32_t _cseq_send = 1;
+    std::string _content_base;
+    std::string _control_url;
+protected:   
+    Rtsp::eRtpType _rtp_type = Rtsp::RTP_TCP;
 
-    //单位毫秒
-	uint32_t _aiFistStamp[2] = {0,0};
-	uint32_t _aiNowStamp[2] = {0,0};
+private:
+    // 当前rtp时间戳  [AUTO-TRANSLATED:410f2691]
+    // Current rtp timestamp
+    uint32_t _stamp[2] = {0, 0};
+
+    // 超时功能实现  [AUTO-TRANSLATED:1d603b3a]
+    // Timeout function implementation
+    toolkit::Ticker _rtp_recv_ticker;
+    std::shared_ptr<toolkit::Timer> _play_check_timer;
+    std::shared_ptr<toolkit::Timer> _rtp_check_timer;
+    // 服务器支持的命令  [AUTO-TRANSLATED:f7f589bf]
+    // Server supported commands
+    std::set<std::string> _supported_cmd;
+    ////////// rtcp ////////////////
+    // rtcp发送时间,trackid idx 为数组下标  [AUTO-TRANSLATED:bf3248b1]
+    // Rtcp send time, trackid idx is the array subscript
+    toolkit::Ticker _rtcp_send_ticker[2];
+    // 统计rtp并发送rtcp  [AUTO-TRANSLATED:0ac2b665]
+    // Statistics rtp and send rtcp
+    std::vector<RtcpContext::Ptr> _rtcp_context;
+    // 用户自定义rtsp头
+    StrCaseMap _custom_header;
 };
 
 } /* namespace mediakit */
-
 #endif /* SRC_RTSPPLAYER_RTSPPLAYER_H_TXT_ */

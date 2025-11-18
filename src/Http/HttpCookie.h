@@ -1,27 +1,11 @@
 ﻿/*
- * MIT License
+ * Copyright (c) 2016-present The ZLMediaKit project authors. All Rights Reserved.
  *
- * Copyright (c) 2016 xiongziliang <771730766@qq.com>
+ * This file is part of ZLMediaKit(https://github.com/ZLMediaKit/ZLMediaKit).
  *
- * This file is part of ZLMediaKit(https://github.com/xiongziliang/ZLMediaKit).
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Use of this source code is governed by MIT-like license that can be found in the
+ * LICENSE file in the root of the source tree. All contributing project authors
+ * may be found in the AUTHORS file in the root of the source tree.
  */
 
 #ifndef ZLMEDIAKIT_HTTPCOOKIE_H
@@ -30,47 +14,59 @@
 #include <string>
 #include <memory>
 #include <vector>
+#include <map>
 #include <unordered_map>
 #include <mutex>
-using namespace std;
 
 namespace mediakit {
 
+/**
+ * http客户端cookie对象
+ * http client cookie object
+ 
+ * [AUTO-TRANSLATED:5c1840bb]
+ */
 class HttpCookie {
 public:
-    typedef std::shared_ptr<HttpCookie> Ptr;
+    using Ptr = std::shared_ptr<HttpCookie>;
     friend class HttpCookieStorage;
-    HttpCookie(){}
-    ~HttpCookie(){}
 
-    void setPath(const string &path);
-    void setHost(const string &host);
-    void setExpires(const string &expires,const string &server_date);
-    void setKeyVal(const string &key,const string &val);
+    void setPath(const std::string &path);
+    void setHost(const std::string &host);
+    void setExpires(const std::string &expires,const std::string &server_date);
+    void setKeyVal(const std::string &key,const std::string &val);
     operator bool ();
 
-    const string &getKey() const ;
-    const string &getVal() const ;
+    const std::string &getKey() const ;
+    const std::string &getVal() const ;
 private:
-    string _host;
-    string _path = "/";
-    uint32_t _expire = 0;
-    string _key;
-    string _val;
+    std::string _host;
+    std::string _path = "/";
+    std::string _key;
+    std::string _val;
+    time_t _expire = 0;
 };
 
 
+/**
+ * http客户端cookie全局保存器
+ * http client cookie global saver
+ 
+ 
+ * [AUTO-TRANSLATED:cac4a704]
+ */
 class HttpCookieStorage{
 public:
-    ~HttpCookieStorage(){}
     static HttpCookieStorage &Instance();
     void set(const HttpCookie::Ptr &cookie);
-    vector<HttpCookie::Ptr> get(const string &host,const string &path);
+    std::vector<HttpCookie::Ptr> get(const std::string &host,const std::string &path);
+
 private:
-    HttpCookieStorage(){};
+    HttpCookieStorage() = default;
+
 private:
-    unordered_map<string,unordered_map<string,HttpCookie::Ptr> > _all_cookie;
-    mutex _mtx_cookie;
+    std::unordered_map<std::string/*host*/, std::map<std::string/*cookie path*/,std::map<std::string/*cookie_key*/, HttpCookie::Ptr> > > _all_cookie;
+    std::mutex _mtx_cookie;
 };
 
 
